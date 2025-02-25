@@ -52,8 +52,8 @@ import tracemalloc
 
 class Backtest():
     def __init__(self):
-        self.symbols = ['LINK-USD', 'XLM-USD'] #'BTC-USD', 'ETH-USD', , 'DOGE-USD', 'SHIB-USD', 'AVAX-USD', 'BCH-USD', 'LINK-USD', 'UNI-USD', 'LTC-USD', 'XLM-USD', 'ETC-USD', 'AAVE-USD', 'XTZ-USD', 'COMP-USD'
-        self.granularites = ['THIRTY_MINUTE','ONE_HOUR','TWO_HOUR','SIX_HOUR','ONE_DAY']#'ONE_MINUTE','FIVE_MINUTE','FIFTEEN_MINUTE',
+        self.symbols = ['BTC-USD', 'ETH-USD', 'DOGE-USD', 'SHIB-USD', 'AVAX-USD', 'BCH-USD', 'LINK-USD', 'UNI-USD', 'LTC-USD', 'XLM-USD', 'ETC-USD', 'AAVE-USD', 'XTZ-USD', 'COMP-USD', 'LINK-USD', 'XLM-USD'] #
+        self.granularities = ['ONE_MINUTE','FIVE_MINUTE','FIFTEEN_MINUTE','THIRTY_MINUTE','ONE_HOUR','TWO_HOUR','SIX_HOUR','ONE_DAY']#,
         self.product = ['XTZ-USD']
         self.granularity = 'ONE_MINUTE'
         
@@ -184,64 +184,54 @@ class Backtest():
             # )
                 
 
-    def run_hyper(self):
+    def run_hyper(self, strategy_obj, param_ranges):
+        """Runs hyperparameter optimization for a given strategy and parameter ranges."""
+        
         risk = Risk_Handler()
-        for granularity in self.granularites:
-            if granularity == 'ONE_MINUTE':
-                days = 25
-            elif granularity == 'FIVE_MINUTE':
-                days = 100
-            elif granularity == 'FIFTEEN_MINUTE':
-                days = 250
-            else:
-                days = 365
-            dict_df = database_interaction.get_historical_from_db(granularity=granularity,
-                                                                symbols=self.symbols,
-                                                                num_days=25)
+
+        for granularity in self.granularities:
+            days = 25 if granularity == 'ONE_MINUTE' else \
+                100 if granularity == 'FIVE_MINUTE' else \
+                250 if granularity == 'FIFTEEN_MINUTE' else 365
+
+            dict_df = database_interaction.get_historical_from_db(
+                granularity=granularity,
+                symbols=self.symbols,
+                num_days=days  # Use `days` based on granularity
+            )
+
             print(f'...Running hyper on {len(self.symbols)} symbols')
 
-            #dict_df = utils.heikin_ashi_transform(dict_df)
-
             start_time = time.time()
-            for i,items in enumerate(dict_df.items()):
-                key, value = items
-                current_dict = {key:value}
-                
-                strat = BollingerBands_RSI(current_dict, risk_object=risk, with_sizing=True)
+            for i, (key, value) in enumerate(dict_df.items()):
+                current_dict = {key: value}
 
+                # Initialize the provided strategy dynamically
+                strat = strategy_obj(current_dict, risk_object=risk, with_sizing=True)
+
+                # Run hyperparameter optimization with dynamic ranges
                 hyper = Hyper(
                     strategy_object=strat,
                     close=strat.close,
-                    bb_period=np.arange(10, 30, step=5),  # Matches bb_period range
-                    bb_dev=np.arange(1, 3, step=0.5),    # Matches bb_dev range
-                    rsi_window=np.arange(10, 20, step=2),# Matches rsi_window range
-                    rsi_buy=np.arange(20, 40, step=5),   # Matches rsi_buy range
-                    rsi_sell=np.arange(60, 80, step=5)   # Matches rsi_sell range
+                    **param_ranges  # Pass dynamic parameter ranges
                 )
 
-
+                # Export hyperparameter results to the database
                 database_interaction.export_hyper_to_db(
                     strategy=strat,
-                    hyper=hyper)
-                
+                    hyper=hyper
+                )
+
                 print(f"Execution Time: {time.time() - start_time}")
                 utils.progress_bar_with_eta(
                     progress=i,
                     data=dict_df.keys(),
-                    start_time=start_time)
+                    start_time=start_time
+                )
+
+                # Cleanup to free memory
                 del hyper
                 gc.collect()
-            
-            # fig = hyper.returns.vbt.volume(# this line is now volume for a 3D
-            #     x_level = 'cust_fast_window',
-            #     y_level = 'cust_slow_window',
-            #     z_level = 'cust_efrato_window',
-            # )
-
-                # fig = hyper.returns.vbt.heatmap(
-                # x_level = 'cust_fast_window',
-                # y_level = 'cust_slow_window')
-                # fig.show()
 
     def chunk_dataframe(slef, df, chunk_size):
         """

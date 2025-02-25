@@ -5,7 +5,7 @@ class ATR(Strategy):
     def __init__(self, dict_df, risk_object=None, with_sizing=False):
         super().__init__(dict_df=dict_df,risk_object=risk_object, with_sizing=with_sizing)
 
-    def custom_indicator(self,atr_window=None):
+    def custom_indicator(self, close=None, atr_window=None):
         self.atr_window = atr_window
 
         atr = self.calculate_atr(atr_window)

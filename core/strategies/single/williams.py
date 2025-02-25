@@ -6,7 +6,7 @@ class WilliamsR(Strategy):
     def __init__(self, dict_df, risk_object=None, with_sizing=False):
         super().__init__(dict_df=dict_df, risk_object=risk_object, with_sizing=with_sizing)
 
-    def custom_indicator(self, time_period=14):
+    def custom_indicator(self, close=None, time_period=14):
         self.signal_period = time_period
 
         willr = self.calculate_williams_r(time_period)

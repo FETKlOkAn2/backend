@@ -6,7 +6,8 @@ class BollingerBands(Strategy):
     def __init__(self, dict_df, risk_object=None, with_sizing=False):
         super().__init__(dict_df=dict_df, risk_object=risk_object, with_sizing=with_sizing)
 
-    def custom_indicator(self, time_period=20, nbdevup=2, nbdevdn=2):
+    def custom_indicator(self, close=None, time_period=20, nbdevup=2, nbdevdn=2):
+
         self.signal_period = time_period
 
         upperband, middleband, lowerband = self.calculate_bollinger_bands(time_period, nbdevup, nbdevdn)

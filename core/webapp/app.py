@@ -4,7 +4,21 @@ from ..backtest import Backtest
 from ..strategies.single.rsi import RSI
 from ..strategies.gpu_optimized.NP.rsi_adx_np import RSI_ADX_NP
 from ..strategies.gpu_optimized.GPU.rsi_adx_gpu import RSI_ADX_GPU
-from ..strategies.gpu_optimized.rsi_bollinger_np import BollingerBands_RSI
+from ..strategies.gpu_optimized.NP.rsi_bollinger_np import BollingerBands_RSI
+from ..strategies.gpu_optimized.NP.bollinger_vwap import BollingerBands_VWAP
+from ..strategies.gpu_optimized.NP.macd_atr_np import MACD_ATR
+from ..strategies.single.rsi import RSI
+from ..strategies.single.bollinger import BollingerBands
+from ..strategies.single.macd import MACD
+from ..strategies.single.adx import ADX
+from ..strategies.single.vwap import Vwap
+from ..strategies.single.atr import ATR
+from ..strategies.single.stochastic import StochasticOscillator
+from ..strategies.single.efratio import EFratio
+from ..strategies.single.williams import WilliamsR
+from ..strategies.single.kama import Kama
+
+import pandas as pd
 import base64
 import plotly.io as pio
 import logging
@@ -18,7 +32,7 @@ from werkzeug.security import check_password_hash
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_secret_key'
-CORS(app, resources={r"/api/*": {"origins": "http://localhost:8080"}}, supports_credentials=True)
+CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 
 
 @app.before_request
@@ -28,6 +42,7 @@ def handle_options():
         response.headers['Access-Control-Allow-Origin'] = request.headers.get('Origin', '*')
         response.headers['Access-Control-Allow-Methods'] = 'GET, POST, OPTIONS'
         response.headers['Access-Control-Allow-Headers'] = 'Authorization, Content-Type'
+        response.headers["Access-Control-Allow-Credentials"] = "true"
         response.status_code = 200
         return response
 
@@ -45,14 +60,43 @@ def to_png(fig):
         app.logger.error(f"Error converting graph to PNG: {str(e)}")
         raise ValueError("Graph conversion failed.")
 
+def convert_results_to_json(results):
+    """Convert pandas Timestamp and Timedelta objects to strings,
+       handling NaT values gracefully."""
+    for key, value in results.items():
+        if pd.isna(value):
+            results[key] = None  # or you can set to an empty string ''
+        elif isinstance(value, pd.Timestamp):
+            try:
+                results[key] = value.isoformat()
+            except Exception:
+                results[key] = str(value)
+        elif isinstance(value, pd.Timedelta):
+            results[key] = str(value)
+    return results
+
+
 @app.route('/api/backtest', methods=['POST'])
 def backtest():
     params = request.json
     app.logger.info(f"Received params: {params}")
 
-    strategy_mapping = {
+    strategy_mapping = { 
         "RSI": RSI,
-        "RSI_ADX_NP": BollingerBands_RSI,
+        "RSI_ADX_NP": RSI_ADX_NP,
+        "RSI_ADX_GPU": RSI_ADX_GPU,
+        "BollingerBands_RSI": BollingerBands_RSI,
+        "BollingerBands_VWAP": BollingerBands_VWAP,
+        "MACD_ATR": MACD_ATR,
+        "BollingerBands": BollingerBands,
+        "MACD": MACD,
+        "ADX": ADX,
+        "Vwap": Vwap,
+        "ATR": ATR,
+        "StochasticOscillator": StochasticOscillator,
+        "EFratio": EFratio,
+        "WilliamsR": WilliamsR,
+        "Kama": Kama
     }
 
     # Ensure the strategy exists
@@ -79,6 +123,8 @@ def backtest():
     if stats is None:
         return jsonify({"status": "error", "message": "Backtest returned no stats"}), 500
 
+    json_friendly_stats = convert_results_to_json(stats)
+
     # Save backtest to the database
     token = request.headers.get('Authorization')
     if not token:
@@ -104,7 +150,7 @@ def backtest():
         app.logger.error(f"Failed to save backtest: {str(e)}")
         return jsonify({"status": "error", "message": "Failed to save backtest"}), 500
 
-    return jsonify({"status": "success", "stats": stats, "graph": graph_base64})
+    return jsonify({"status": "success", "stats": json_friendly_stats, "graph": graph_base64})
 
 @app.route('/api/register', methods=['POST'])
 def register():

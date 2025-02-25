@@ -6,7 +6,7 @@ class StochasticOscillator(Strategy):
     def __init__(self, dict_df, risk_object=None, with_sizing=False):
         super().__init__(dict_df=dict_df, risk_object=risk_object, with_sizing=with_sizing)
 
-    def custom_indicator(self, fastk_period=14, slowk_period=3, slowd_period=3):
+    def custom_indicator(self, close=None, fastk_period=14, slowk_period=3, slowd_period=3):
         self.signal_period = fastk_period
 
         slowk, slowd = self.calculate_stochastic(fastk_period, slowk_period, slowd_period)

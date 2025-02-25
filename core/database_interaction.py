@@ -25,7 +25,7 @@ logging.basicConfig(level=logging.INFO)  # Set to DEBUG, INFO, WARNING, ERROR, C
 
 
 from dotenv import load_dotenv
-load_dotenv()
+load_dotenv(override=True)
 
 db_path = os.getenv('DATABASE_PATH')
 print("DATABASE_PATH : ", db_path)
@@ -77,7 +77,7 @@ def get_best_params(strategy_object, df_manager=None, live_trading=False, best_o
     granularities = ['ONE_MINUTE', 'FIVE_MINUTE', 'FIFTEEN_MINUTE', 'THIRTY_MINUTE', 'ONE_HOUR', 'TWO_HOUR', 'SIX_HOUR', 'ONE_DAY']
     
     try:
-        conn = sql.connect(f'{db_path}/test_hyper.db')
+        conn = sql.connect(f'{db_path}/hyper.db') #or test_hyper.db
         print('Connected to the database successfully.')
     except Exception as e:
         print('Failed to connect to the database:', e)
@@ -337,7 +337,7 @@ def export_hyper_to_db(strategy: object, hyper: object):
     db_lock = Lock()
     def get_connection():
         with db_lock:
-            return sql.connect(f'{db_path}/test_hyper.db')
+            return sql.connect(f'{db_path}/hyper.db') #test_hyper
 
     conn = get_connection()
 
@@ -354,16 +354,24 @@ def export_hyper_to_db(strategy: object, hyper: object):
         print(f"Stats: {stats}")
         print(f"Stats name: {stats.name}")
         backtest_dict = {'symbol': symbol}
-        for j,param in enumerate(params):
-            print(j, param, stats.name[j])
-            backtest_dict[param] = stats.name[j]
-
+        
+        # If stats.name is not iterable, wrap it in a list.
+        name_list = stats.name if isinstance(stats.name, (list, tuple)) else [stats.name]
+        
+        for j, param in enumerate(params):
+            # Check if name_list has enough elements
+            if j < len(name_list):
+                print(j, param, name_list[j])
+                backtest_dict[param] = name_list[j]
+            else:
+                print(f"Warning: Not enough values in stats.name for parameter '{param}'.")
+        
         for key, value in stats.items():
             if key in stats_to_export:
                 backtest_dict[key] = value
 
-        combined_df = pd.concat([combined_df,pd.DataFrame([backtest_dict])])
-    # sys.quit()
+        combined_df = pd.concat([combined_df, pd.DataFrame([backtest_dict])])
+
 
     # Prepare table name
     table_name = f"{strategy.__class__.__name__}_{granularity}"
