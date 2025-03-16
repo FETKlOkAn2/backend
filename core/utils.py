@@ -95,31 +95,34 @@ def calculate_with_sizing_numba(signal, close, percent_to_size):
                 saved_close = 0.0
     return new_signal
 
-def progress_bar_with_eta(progress, data, start_time, bar_length=50):
+import time
+import sys
+
+def progress_bar_with_eta(progress, data, start_time, socketio=None, symbol=None, socket_invoker="progress_update"):
     total = len(data)
-    progress +=1
+    progress += 1  # Increment progress
 
-    elapsed_time = time.time() - start_time  # Time passed since start
+    elapsed_time = time.time() - start_time  
     avg_time_per_item = elapsed_time / progress if progress > 0 else 0
-    eta = avg_time_per_item * (total - progress)  # Estimate remaining time in seconds
+    eta = avg_time_per_item * (total - progress)
 
-    # Format ETA as minutes and seconds
     eta_minutes = int(eta // 60)
     eta_seconds = int(eta % 60)
 
-    # Calculate percentage and progress bar
-    if progress >= total:
-        percent = 100
-        bar = '#' * bar_length
-        eta_minutes = 0
-        eta_seconds = 0
-    else:
-        percent = int((progress / total) * 100)
-        bar = ('#' * int(bar_length * (progress / total))).ljust(bar_length)
+    percent = int((progress / total) * 100) if total > 0 else 100
 
-    # Display the progress bar and ETA
-    sys.stdout.write(f'\r|{bar}| {percent}% Complete | ETA: {eta_minutes:02d}:{eta_seconds:02d} remaining')
+    # ✅ Only emit if socketio is not None
+    if socketio:
+        socketio.emit(socket_invoker, {
+            "symbol": symbol,
+            "progress": percent,
+            "eta": f"{eta_minutes:02d}:{eta_seconds:02d}"
+        })
+    
+    # Still print to console if needed
+    sys.stdout.write(f'\r[{symbol}] {percent}% Complete | ETA: {eta_minutes:02d}:{eta_seconds:02d}')
     sys.stdout.flush()
+
 
 def find_unix(days_ago: int):
     now = dt.datetime.now()

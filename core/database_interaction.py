@@ -78,13 +78,13 @@ def get_best_params(strategy_object, df_manager=None, live_trading=False, best_o
     
     try:
         conn = sql.connect(f'{db_path}/hyper.db') #or test_hyper.db
-        print('Connected to the database successfully.')
+        #print('Connected to the database successfully.')
     except Exception as e:
-        print('Failed to connect to the database:', e)
+        #print('Failed to connect to the database:', e)
         return None
 
-    print('Getting best params...')
-    print(f'DATABASE_PATH (best params): {db_path}/hyper.db')
+    #print('Getting best params...')
+    #print(f'DATABASE_PATH (best params): {db_path}/hyper.db')
 
     try:
         if best_of_all_granularities:
@@ -94,7 +94,7 @@ def get_best_params(strategy_object, df_manager=None, live_trading=False, best_o
             
             for granularity in granularities:
                 try:
-                    print(f'Processing granularity: {granularity}')
+                    #print(f'Processing granularity: {granularity}')
                     table = f"RSI_ADX_GPU_{granularity}" if strategy_object.__class__.__name__ == "RSI_ADX_NP" else f"{strategy_object.__class__.__name__}_{granularity}"
                     
                     params = inspect.signature(strategy_object.custom_indicator)
@@ -109,13 +109,13 @@ def get_best_params(strategy_object, df_manager=None, live_trading=False, best_o
                     query = f'SELECT {parameters}, MAX("Total Return [%]") AS max_return FROM {table} WHERE symbol="{symbol}"'
                     if minimum_trades is not None:
                         query += f' AND "Total Trades" >= {minimum_trades}'
-                    print(f"Executing query: {query}")
+                    #print(f"Executing query: {query}")
 
                     result = pd.read_sql_query(query, conn)
-                    print(f"Query result for {granularity}:", result)
+                    #print(f"Query result for {granularity}:", result)
 
                     if result.empty or all(result.iloc[0].isnull()):
-                        print(f"No valid results for granularity: {granularity}")
+                        #print(f"No valid results for granularity: {granularity}")
                         continue
 
                     max_return = result['max_return'].iloc[0]
@@ -123,7 +123,7 @@ def get_best_params(strategy_object, df_manager=None, live_trading=False, best_o
                         result[param].iloc[0] if param in result.columns else None for param in param_keys
                     ]
 
-                    print(f"Results for {granularity}: max_return={max_return}, parameters={list_results}")
+                    #print(f"Results for {granularity}: max_return={max_return}, parameters={list_results}")
 
                     # Update the best results if this granularity has a higher return
                     if max_return > best_return:
@@ -182,10 +182,10 @@ def get_best_params(strategy_object, df_manager=None, live_trading=False, best_o
                 query = f'SELECT {parameters}, MAX("Total Return [%]") AS max_return FROM {table} WHERE symbol="{symbol}"'
                 if minimum_trades is not None:
                     query += f' AND "Total Trades" >= {minimum_trades}'
-                print(f"Executing query: {query}")
+                #print(f"Executing query: {query}")
 
                 result = pd.read_sql_query(query, conn)
-                print(f"Query result:", result)
+                #print(f"Query result:", result)
 
                 list_results = [
                     result[param].iloc[0] for param in param_keys if param in result.columns
@@ -198,7 +198,7 @@ def get_best_params(strategy_object, df_manager=None, live_trading=False, best_o
     finally:
         try:
             conn.close()
-            print('Database connection closed successfully.')
+            #print('Database connection closed successfully.')
         except Exception as e:
             print('Failed to close the database connection:', e)
 
@@ -428,13 +428,14 @@ def export_historical_to_db(dict_df, granularity):
     conn.close()
 
 
-def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None):
+def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None, socketio=None):
     """
     Resamples data from the database for different timeframes based on the granularity.
     """
     if callback:
         callback(f"...Resampling Database")
     print("\n...Resampling Database")
+    
     times_to_resample = {
         'FIVE_MINUTE': '5min',
         'FIFTEEN_MINUTE': '15min',
@@ -444,7 +445,6 @@ def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None):
         'SIX_HOUR': '6h',
         'ONE_DAY': '1D'
     }
-
 
     dict_df = get_historical_from_db(granularity=granularity)
 
@@ -465,10 +465,11 @@ def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None):
 
             df_resampled.dropna(inplace=True)
 
-
             resampled_dict_df[symbol] = df_resampled
+        
         export_historical_to_db(resampled_dict_df, granularity=key)
-        utils.progress_bar_with_eta(i, data= times_to_resample.keys(), start_time=start_time)
+
+        utils.progress_bar_with_eta(i, data=times_to_resample.keys(), start_time=start_time, socketio=socketio, symbol=key, socket_invoker="resampling_progress")
 
 
 

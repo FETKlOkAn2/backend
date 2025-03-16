@@ -3,10 +3,13 @@ from core.coinbase_wrapper import Coinbase_Wrapper
 import core.database_interaction as database_interaction
 
 class Scanner():
-    def __init__(self, client):
+    def __init__(self, client, socketio=None):
         self.coinbase = Coinbase_Wrapper()
         self.client = client
         self.granularity = self.client.granularity
+        
+        self.socketio = socketio  # Store socketio
+        self.coinbase = Coinbase_Wrapper(socketio=self.socketio)
 
         self.products = self.client.all_products
         self.df_manager = None

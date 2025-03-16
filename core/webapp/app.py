@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from flask_socketio import SocketIO, emit
 from ..backtest import Backtest
 from ..strategies.single.rsi import RSI
 from ..strategies.gpu_optimized.NP.rsi_adx_np import RSI_ADX_NP
@@ -17,13 +18,15 @@ from ..strategies.single.stochastic import StochasticOscillator
 from ..strategies.single.efratio import EFratio
 from ..strategies.single.williams import WilliamsR
 from ..strategies.single.kama import Kama
-
+from ..livetrader import LiveTrader
 import pandas as pd
 import base64
 import plotly.io as pio
 import logging
 import datetime
 import jwt
+import asyncio
+import threading
 import core.database_interaction as database_interaction
 from werkzeug.security import generate_password_hash
 from werkzeug.security import check_password_hash
@@ -34,7 +37,10 @@ app = Flask(__name__)
 app.config['SECRET_KEY'] = 'your_secret_key'
 CORS(app, resources={r"/api/*": {"origins": "*"}}, supports_credentials=True)
 
+socketio = SocketIO(app, cors_allowed_origins="*")
 
+live_trader_instance = None  
+trading_task = None
 @app.before_request
 def handle_options():
     if request.method == 'OPTIONS':
@@ -74,7 +80,6 @@ def convert_results_to_json(results):
         elif isinstance(value, pd.Timedelta):
             results[key] = str(value)
     return results
-
 
 @app.route('/api/backtest', methods=['POST'])
 def backtest():
@@ -232,6 +237,51 @@ def get_history():
         app.logger.error(f"Invalid token: {e}")
         return jsonify({"status": "error", "message": "Invalid token"}), 403
 
+def run_livetrader():
+    global live_trader_instance
+    if live_trader_instance is None:
+        live_trader_instance = LiveTrader(socketio)  # Ensure instance is created
+
+    def log_message(msg):
+        print(msg)  
+        socketio.emit('log_update', {"message": msg})  
+
+    live_trader_instance.log = log_message  
+    asyncio.run(live_trader_instance.main())  # <-- This keeps running in a loop!
+
+
+@app.route('/api/start_trading', methods=['POST'])
+def start_trading():
+    global live_trader_instance, trading_task
+    if live_trader_instance is None:
+        live_trader_instance = LiveTrader(socketio)  # Initialize only once
+
+    if trading_task is None or not trading_task.is_alive():
+        trading_task = threading.Thread(target=run_livetrader, daemon=True)
+        trading_task.start()
+        return jsonify({"status": "success", "message": "Live trading started"}), 200
     
+    return jsonify({"status": "error", "message": "Live trading is already running"}), 400
+
+
+@socketio.on("connect")
+def handle_connect():
+    print("Client connected to WebSocket")
+    emit("log_update", {"message": "Connected to server!"})
+@app.route('/api/stop_trading', methods=['POST'])
+def stop_trading():
+    global live_trader_instance
+    if live_trader_instance:
+        live_trader_instance.stop()
+        return jsonify({"status": "success", "message": "Live trading stopped"}), 200
+    return jsonify({"status": "error", "message": "Live trading not running"}), 400
+
+@app.route('/api/live_status', methods=['GET'])
+def get_live_status():
+    global live_trader_instance
+    if live_trader_instance:
+        return jsonify(live_trader_instance.get_status()), 200
+    return jsonify({"status": "error", "message": "Live trading not running"}), 400
+
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, debug=True)
+    socketio.run(app, host='0.0.0.0', port=5000, debug=True, allow_unsafe_werkzeug=True)

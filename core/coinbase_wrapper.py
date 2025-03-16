@@ -13,8 +13,10 @@ import os
 import sys
 
 class Coinbase_Wrapper():
-    def __init__(self):
+    def __init__(self, socketio=None):
         load_dotenv(override=True)
+        
+        self.socketio = socketio
 
         self.db_path = os.getenv('DATABASE_PATH')
         self.api_key = os.getenv('DOTENV_API_KEY_COINBASE')
@@ -152,20 +154,19 @@ class Coinbase_Wrapper():
 
         return missing_ranges
 
-    def get_candles_for_db(self, symbols: list, granularity: str, days: int=None, callback=None):
-        """Function that gets candles for every pair of timestamps and combines them all, avoiding redundant data fetching."""
-
+    def get_candles_for_db(self, symbols: list, granularity: str, days: int = None, callback=None, socketio=None):
+        """Fetch candles and send real-time progress to frontend."""
         timestamps = self._get_unix_times(granularity, days=days)
-        #print(f'Getting Data For {len(symbols)} Symbols')
 
         for symbol in symbols:
             if callback:
                 callback(f"..getting data for {symbol}")
-            print(f'\n...getting data for {symbol}')
+            if socketio:
+                socketio.emit("log_update", {"message": f"Fetching data for {symbol}"})
+            print(f"\nFetching data for {symbol}")
             combined_df = pd.DataFrame()
-
-            # Get existing data from the database
             existing_data = self._get_data_from_db(symbol, granularity)
+
             if not existing_data.empty:
                 existing_start_unix = int(existing_data.index.min().timestamp())
                 existing_end_unix = int(existing_data.index.max().timestamp())
@@ -173,61 +174,62 @@ class Coinbase_Wrapper():
                 existing_start_unix = None
                 existing_end_unix = None
 
-            # For each desired date range, adjust the range to exclude existing data
             missing_date_ranges = []
             for desired_start_unix, desired_end_unix in timestamps:
-                if existing_start_unix is not None and existing_end_unix is not None:
-                    missing_ranges = self._get_missing_unix_range(
-                        desired_start_unix,
-                        desired_end_unix,
-                        existing_start_unix,
-                        existing_end_unix
-                    )
-                else:
-                    missing_ranges = [(desired_start_unix, desired_end_unix)]
+                missing_ranges = self._get_missing_unix_range(
+                    desired_start_unix, desired_end_unix, existing_start_unix, existing_end_unix
+                ) if existing_start_unix is not None and existing_end_unix is not None else [(desired_start_unix, desired_end_unix)]
 
                 missing_date_ranges.extend(missing_ranges)
 
-            # If the desired date ranges are fully covered by existing data, skip fetching
             if not missing_date_ranges:
-                print(f"All data for {symbol} is already up to date.")
+                if socketio:
+                    socketio.emit("log_update", {"message": f"All data for {symbol} is already up to date."})
                 continue
 
-            # Now fetch data for missing date ranges
             data_found = False
             start_time = time.time()
+
             for i, missing_range in enumerate(missing_date_ranges):
                 start_unix, end_unix = missing_range
-
-                # Attempt to fetch data for this range
                 df = self._fetch_data(symbol, start_unix, end_unix, granularity)
+
                 if not df.empty:
                     data_found = True
                     combined_df = pd.concat([combined_df, df], ignore_index=True)
-                utils.progress_bar_with_eta(i, missing_date_ranges, start_time=start_time)
 
-            # Combine with existing data
+                utils.progress_bar_with_eta(i, missing_date_ranges, start_time, self.socketio, symbol)
+                percent = int(((i + 1) / len(missing_date_ranges)) * 100)
+                eta = (time.time() - start_time) / (i + 1) * (len(missing_date_ranges) - (i + 1))
+                eta_minutes, eta_seconds = divmod(int(eta), 60)
+                if socketio:
+                    socketio.emit("progress_update", {
+                        "symbol": symbol,
+                        "progress": percent,
+                        "eta": f"{eta_minutes:02d}:{eta_seconds:02d}"
+                    })
+
             if data_found:
-                if not existing_data.empty:
-                    combined_df = pd.concat([combined_df, existing_data.reset_index()], ignore_index=True)
+                sorted_df = combined_df.sort_values(by="date", ascending=True).reset_index(drop=True)
+                columns_to_convert = ['low', 'high', 'open', 'close', 'volume']
+                for col in columns_to_convert:
+                    sorted_df[col] = pd.to_numeric(sorted_df[col], errors='coerce')
+                sorted_df.set_index("date", inplace=True)
+                sorted_df = sorted_df[~sorted_df.index.duplicated(keep="first")]
+                combined_data = {symbol: sorted_df}
 
-                if not combined_df.empty:
-                    sorted_df = combined_df.sort_values(by='date', ascending=True).reset_index(drop=True)
-                    columns_to_convert = ['low', 'high', 'open', 'close', 'volume']
-                    for col in columns_to_convert:
-                        sorted_df[col] = pd.to_numeric(sorted_df[col], errors='coerce')
-                    sorted_df.set_index('date', inplace=True)
-                    # Remove duplicates based on index
-                    sorted_df = sorted_df[~sorted_df.index.duplicated(keep='first')]
-                    combined_data = {symbol: sorted_df}
-
-                    # Export data to the database
-                    database_interaction.export_historical_to_db(combined_data, granularity=granularity)
+                if socketio:
+                    socketio.emit("log_update", {"message": f"Saving data for {symbol}"})
+                database_interaction.export_historical_to_db(combined_data, granularity=granularity)
             else:
-                print(f"No new data available for {symbol} in the specified date ranges.")
+                if socketio:
+                    socketio.emit("log_update", {"message": f"No new data available for {symbol}."})
 
         # Resample data in the database
-        database_interaction.resample_dataframe_from_db(granularity=granularity, callback=callback)
+        database_interaction.resample_dataframe_from_db(granularity=granularity, callback=callback, socketio=self.socketio)
+        if socketio:
+            socketio.emit("log_update", {"message": "Resampling database completed."})
+
 
     def _get_existing_data(self, symbol: str, granularity: str):
         """Retrieve existing data from the database and get its date range."""
