@@ -1,6 +1,0 @@
-study_name,trial_id,value,params
-BollingerBands_VWAP_GPU_LINK-USD_ONE_HOUR,14,0.5106515739501755,"{'bb_period': 11, 'bb_dev': 3.0, 'vwap_window': 42}"
-BollingerBands_VWAP_GPU_LINK-USD_ONE_HOUR,67,0.5106515739501755,"{'bb_period': 11, 'bb_dev': 3.0, 'vwap_window': 39}"
-BollingerBands_VWAP_GPU_XLM-USD_ONE_HOUR,74,1.2004246047849383,"{'bb_period': 11, 'bb_dev': 3.0, 'vwap_window': 24}"
-BollingerBands_VWAP_GPU_XLM-USD_ONE_HOUR,75,1.2004246047849383,"{'bb_period': 11, 'bb_dev': 3.0, 'vwap_window': 24}"
-BollingerBands_VWAP_GPU_XLM-USD_ONE_HOUR,81,1.2004246047849383,"{'bb_period': 11, 'bb_dev': 3.0, 'vwap_window': 20}"
