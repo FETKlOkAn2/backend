@@ -15,7 +15,7 @@ print("DATABASE_PATH : ", db_path)  # Ensure the correct database path is printe
 class BacktestWithBayesian(Backtest):
     def run_bayesian_optimization(self, strategy_class, n_trials=100):
         for symbol in self.symbols:
-            for granularity in self.granularites:
+            for granularity in self.granularities:
                 study_name = f"{strategy_class.__name__}_{symbol}_{granularity}"
                 def objective(trial):
                     # Define parameter ranges

@@ -187,7 +187,7 @@ class Strategy:
 
 
     def graph(self, graph_callback=None):
-        print(f"Data available - Close: {len(self.close)}, Entries: {self.entries is not None}, Exits: {self.exits is not None}")
+        """Graphs the strategy with technical indicators and signals"""
         try:
             # Initialize the candlestick figure
             fig1 = go.Figure(data=[go.Candlestick(
@@ -269,7 +269,7 @@ class Strategy:
             # Final check for combined figure
             if not fig_combined or len(fig_combined.data) == 0:
                 print("Error: Combined figure is empty.")
-                return
+                return None
 
             # Display or call callback
             if graph_callback:
@@ -278,9 +278,13 @@ class Strategy:
             else:
                 print("Displaying the figure directly.")
                 fig_combined.show()
+                
+            # Return the figure
+            return fig_combined
 
         except Exception as e:
             print(f"Error while graphing: {e}")
+            return None
 
 
 

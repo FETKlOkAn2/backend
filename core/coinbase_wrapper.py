@@ -1,3 +1,6 @@
+# mypy: disable-error-code=import-untyped
+# pylint: disable=C0114
+
 import datetime as dt
 import pandas as pd
 import core.utils as utils
@@ -28,7 +31,7 @@ class Coinbase_Wrapper():
         self.coinbase_robin_crypto = ['BTC-USD', 'ETH-USD', 'DOGE-USD', 'SHIB-USD', 'AVAX-USD', 'BCH-USD', 'LINK-USD', 'UNI-USD', 'LTC-USD', 'XLM-USD', 'ETC-USD', 'AAVE-USD', 'XTZ-USD', 'COMP-USD']
 
     
-    def _get_unix_times(self, granularity: str, days: int = None):
+    def _get_unix_times(self, granularity: str, days: int = 1):
         # Mapping each timeframe to its equivalent seconds value
         timeframe_seconds = {
             'ONE_MINUTE': 60,
@@ -154,7 +157,7 @@ class Coinbase_Wrapper():
 
         return missing_ranges
 
-    def get_candles_for_db(self, symbols: list, granularity: str, days: int = None, callback=None, socketio=None):
+    def get_candles_for_db(self, symbols: list, granularity: str, days: int = 1, callback=None, socketio=None):
         """Fetch candles and send real-time progress to frontend."""
         timestamps = self._get_unix_times(granularity, days=days)
 
@@ -174,7 +177,7 @@ class Coinbase_Wrapper():
                 existing_start_unix = None
                 existing_end_unix = None
 
-            missing_date_ranges = []
+            missing_date_ranges:list = []
             for desired_start_unix, desired_end_unix in timestamps:
                 missing_ranges = self._get_missing_unix_range(
                     desired_start_unix, desired_end_unix, existing_start_unix, existing_end_unix
@@ -251,8 +254,7 @@ class Coinbase_Wrapper():
                     desired_start_unix,
                     desired_end_unix,
                     existing_start_unix,
-                    existing_end_unix,
-                    fetch_older_data=fetch_older_data
+                    existing_end_unix
                 )
             else:
                 missing_ranges = [(desired_start_unix, desired_end_unix)]
