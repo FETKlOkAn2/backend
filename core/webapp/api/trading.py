@@ -5,13 +5,13 @@ from core.webapp.services.trading_service import get_live_trader_instance, start
 trading_bp = Blueprint('trading', __name__)
 trader_lock = threading.Lock()
 
-@trading_bp.route('/start_trading', methods=['POST'])
+@trading_bp.route('/trading/start_trading', methods=['POST'])
 def start_trading():
     """Start live trading."""
     with trader_lock:
         try:
             # Check if trading is already running
-            if get_live_trader_instance() and get_live_trader_instance().is_running:
+            if get_live_trader_instance() and get_live_trader_instance().running:
                 return jsonify({
                     "status": "error", 
                     "message": "Live trading is already running"
@@ -32,12 +32,12 @@ def start_trading():
                 "message": f"Error starting trading: {str(e)}"
             }), 500
 
-@trading_bp.route('/stop_trading', methods=['POST'])
+@trading_bp.route('/trading/stop_trading', methods=['POST'])
 def stop_trading():
     """Stop live trading."""
     try:
         trader = get_live_trader_instance()
-        if trader and getattr(trader, 'is_running', False):
+        if trader and getattr(trader, 'running', False):
             stop_live_trading()
             return jsonify({
                 "status": "success", 
@@ -61,7 +61,7 @@ def get_live_status():
     """Get current live trading status."""
     try:
         trader = get_live_trader_instance()
-        status = "active" if trader and getattr(trader, 'is_running', False) else "inactive"
+        status = "active" if trader and getattr(trader, 'running', False) else "inactive"
         
         return jsonify({
             "status": status, 

@@ -13,3 +13,5 @@ class Config:
     
     # Backtest configuration
     BACKTEST_DEFAULT_DAYS = 30  # Default number of days for backtesting
+
+config = Config()
