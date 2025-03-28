@@ -76,3 +76,121 @@ def register_socket_handlers(socketio):
         emit('heartbeat_ack', {
             "timestamp": datetime.datetime.now().isoformat()
         })
+        
+    @socketio.on('request_graph')
+    def handle_request_graph(data):
+        """Handle requests for symbol graphs"""
+        trader = get_live_trader_instance()
+        if not trader:
+            emit('log_update', {
+                "message": f"Error: Trading service not active",
+                "type": "error",
+                "timestamp": datetime.datetime.now().isoformat()
+            })
+            return
+            
+        symbol = data.get('symbol')
+        resampling_factor = data.get('resamplingFactor', '15m')  # Default to 15m if not specified
+        
+        if not symbol:
+            emit('log_update', {
+                "message": f"Error: No symbol specified for graph request",
+                "type": "error",
+                "timestamp": datetime.datetime.now().isoformat()
+            })
+            return
+            
+        try:
+            print(f"Graph requested for {symbol} with resampling {resampling_factor}")
+            
+            # Update data for the specific symbol
+            trader.df_manager.data_for_live_trade(symbol=symbol, update=True, resampling=resampling_factor)
+            current_dict = {symbol: trader.df_manager.dict_df[symbol]}
+            
+            # Use the same strategy as the trading logic
+            from core.strategies.gpu_optimized.GPU.rsi_adx_gpu import RSI_ADX_GPU
+            strat = RSI_ADX_GPU(current_dict, trader.risk, with_sizing=True, hyper=False)
+            
+            # Use the parameters specific to this symbol
+            params = trader.risk.symbol_params.get(symbol, [14, 14, 20, 80])
+            strat.custom_indicator(strat.close, *params)
+            
+            # Define a callback to capture the graph output
+            # In your graph method, ensure the callback marking is done properly
+            def graph_callback(fig):
+                try:
+                    # Convert graph to base64 image
+                    import plotly.io as pio
+                    import base64
+                    img_bytes = pio.to_image(fig, format="png")
+                    graph_base64 = base64.b64encode(img_bytes).decode('utf-8')
+                    
+                    # Send the graph to the client
+                    emit('graph_update', {
+                        'symbol': symbol,
+                        'graph': graph_base64
+                    })
+                    
+                    print(f"Graph for {symbol} sent successfully")
+                    # Mark that we've handled this graph
+                    setattr(fig, '_sent_to_client', True)
+                    return True
+                except Exception as e:
+                    print(f"Error generating graph image: {str(e)}")
+                    return False
+            
+            # Generate and send the graph
+            fig = strat.graph(graph_callback)
+            
+            # If graph_callback wasn't called (which can happen), try to send the graph directly
+            if fig is not None and not hasattr(fig, '_sent_to_client'):
+                try:
+                    import plotly.io as pio
+                    import base64
+                    img_bytes = pio.to_image(fig, format="png")
+                    graph_base64 = base64.b64encode(img_bytes).decode('utf-8')
+                    
+                    emit('graph_update', {
+                        'symbol': symbol,
+                        'graph': graph_base64
+                    })
+                    
+                    print(f"Graph for {symbol} sent directly")
+                except Exception as e:
+                    print(f"Error sending graph directly: {str(e)}")
+                    emit('log_update', {
+                        "message": f"Error generating graph: {str(e)}",
+                        "type": "error",
+                        "timestamp": datetime.datetime.now().isoformat()
+                    })
+            
+        except Exception as e:
+            print(f"Error processing graph request for {symbol}: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            emit('log_update', {
+                "message": f"Error generating graph for {symbol}: {str(e)}",
+                "type": "error",
+                "timestamp": datetime.datetime.now().isoformat()
+            })
+            
+    @socketio.on('change_resampling')
+    def handle_change_resampling(data):
+        """Handle change in resampling factor"""
+        factor = data.get('factor')
+        if factor:
+            try:
+                # Store the preferred resampling factor in the session
+                session['resampling_factor'] = factor
+                emit('log_update', {
+                    "message": f"Resampling factor changed to {factor}",
+                    "type": "info",
+                    "timestamp": datetime.datetime.now().isoformat()
+                })
+            except Exception as e:
+                print(f"Error changing resampling factor: {str(e)}")
+                emit('log_update', {
+                    "message": f"Error changing resampling factor: {str(e)}",
+                    "type": "error",
+                    "timestamp": datetime.datetime.now().isoformat()
+                })

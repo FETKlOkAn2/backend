@@ -259,6 +259,7 @@ class LiveTrader:
                 
                 fig = strat.graph(self.graph_callback)
                 self.log(f"Graph return value for {symbol}: {fig is not None}", "debug")
+                
                 # Send graph to frontend if available
                 if fig:
                     try:
@@ -272,6 +273,7 @@ class LiveTrader:
                         })
                         
                         self.log(f"Generated graph for {symbol}", "info")
+                        return signal_type  # Return the signal type here
                     except Exception as e:
                         self.log(f"Error generating graph for {symbol}: {str(e)}", "error")
             except Exception as e:

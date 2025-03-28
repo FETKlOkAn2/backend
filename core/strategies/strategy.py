@@ -271,10 +271,16 @@ class Strategy:
                 print("Error: Combined figure is empty.")
                 return None
 
+            # Mark that we're handling this graph
+            setattr(fig_combined, '_sent_to_client', False)
+
             # Display or call callback
             if graph_callback:
                 print("Graph callback is being called with a figure.")
-                graph_callback(fig_combined)
+                result = graph_callback(fig_combined)
+                # Mark if the callback successfully handled the graph
+                if result:
+                    setattr(fig_combined, '_sent_to_client', True)
             else:
                 print("Displaying the figure directly.")
                 fig_combined.show()
@@ -284,6 +290,8 @@ class Strategy:
 
         except Exception as e:
             print(f"Error while graphing: {e}")
+            import traceback
+            traceback.print_exc()
             return None
 
 

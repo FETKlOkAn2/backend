@@ -181,3 +181,19 @@ def to_df(data_dict: dict):
     return df
  
 
+# In utils.py
+def convert_resampling_to_granularity(resampling):
+    """Convert resampling string to granularity format"""
+    # Map resampling formats to granularity formats
+    resampling_map = {
+        '1m': 'ONE_MINUTE',
+        '5m': 'FIVE_MINUTE',
+        '15m': 'FIFTEEN_MINUTE',
+        '30m': 'THIRTY_MINUTE',
+        '1h': 'ONE_HOUR',
+        '2h': 'TWO_HOUR',
+        '6h': 'SIX_HOUR',
+        '1d': 'ONE_DAY'
+    }
+    
+    return resampling_map.get(resampling, 'FIFTEEN_MINUTE')  # Default to 15 minutes

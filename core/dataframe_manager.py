@@ -39,31 +39,36 @@ class DF_Manager():
                 self.dict_df[k] = v
 
 
-    def data_for_live_trade(self,symbol, update=False):
+    def data_for_live_trade(self, symbol, update=False, resampling=None):
         """dataframe needs to be indexed by symbol"""
-
+        
         coinbase_symbol = utils.convert_symbols(lone_symbol=symbol)
         granularity = self.products_granularity[symbol]
         print("granularity for livetrading: ", granularity)
-
+        
+        # If resampling is provided, use it
+        if resampling:
+            granularity = utils.convert_resampling_to_granularity(resampling)
+        
         timestamps = self.coinbase._get_unix_times(
             granularity=granularity,
             days=1
         )
-
+        
         new_dict_df = self.coinbase.get_basic_candles(
             symbols=[coinbase_symbol],
-            timestamps = timestamps,
+            timestamps=timestamps,
             granularity=granularity
         )
         new_dict_df[symbol] = new_dict_df.pop(coinbase_symbol)
-
+        
         # If updating, add only the last row if symbol exists
         if update:
             self.dict_df[symbol] = pd.concat([self.dict_df[symbol], new_dict_df[symbol]]).drop_duplicates()
         else:
             self.dict_df[symbol] = new_dict_df
-
+            
+        return self.dict_df[symbol]  # Return the updated dataframe
     def set_next_update(self, symbol, initial=False):
         if initial:
             next_update_in = dt.datetime.now() - pd.Timedelta(seconds=20)

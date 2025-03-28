@@ -34,6 +34,7 @@ STRATEGY_MAP = {
     "Kama": Kama
 }
 
+
 def get_strategy_class(strategy_name):
     """Get the strategy class from the strategy name."""
     return STRATEGY_MAP.get(strategy_name)
