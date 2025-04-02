@@ -21,7 +21,15 @@ logging.getLogger("matplotlib").setLevel(logging.WARNING)
 logging.getLogger("numpy").setLevel(logging.WARNING)
 
 # Set your own logging level if needed
-logging.basicConfig(level=logging.INFO)  # Set to DEBUG, INFO, WARNING, ERROR, CRITICAL as needed
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s: %(message)s',
+    handlers=[
+        logging.FileHandler('ai_backtest.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logger = logging.getLogger(__name__) # Set to DEBUG, INFO, WARNING, ERROR, CRITICAL as needed
 
 
 from dotenv import load_dotenv
@@ -443,7 +451,7 @@ def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None, socketio
         'ONE_HOUR': '1h',
         'TWO_HOUR': '2h',
         'SIX_HOUR': '6h',
-        'ONE_DAY': '1D'
+        'ONE_DAY': '1d'
     }
 
     dict_df = get_historical_from_db(granularity=granularity)
@@ -453,6 +461,7 @@ def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None, socketio
     for i, key in enumerate(times_to_resample.keys()):
         value = times_to_resample[key]
         for symbol, df in dict_df.items():
+            print(symbol, df)
             df = df.sort_index()
 
             df_resampled = df.resample(value).agg({
@@ -672,3 +681,259 @@ def export_optimization_results_to_db(study, strategy_class):
 #     finally:
 #         conn.close()
 #         print("Database connection closed.")
+
+from contextlib import contextmanager
+import json
+import threading
+from threading import Lock
+import sqlite3 as sql
+import pandas as pd
+import os
+
+# Use your existing database connection logic
+@contextmanager
+def get_db_connection(db_name):
+    db_lock = Lock()
+    with db_lock:
+        conn = sql.connect(f'{db_path}/{db_name}.db')
+        try:
+            yield conn
+        finally:
+            conn.close()
+
+def initialize_backtest_tables(conn):
+    """Create tables to store backtest results if they don't exist"""
+    cursor = conn.cursor()
+    
+    # Table for overall backtest results
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS backtest_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        granularity TEXT,
+        start_date TEXT,
+        end_date TEXT,
+        initial_capital REAL,
+        final_value REAL,
+        total_return REAL,
+        annualized_return REAL,
+        sharpe_ratio REAL,
+        max_drawdown REAL,
+        total_trades INTEGER,
+        win_rate REAL,
+        timestamp TEXT
+    )
+    ''')
+    
+    # Table for model metrics
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS model_metrics (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        backtest_id INTEGER,
+        accuracy REAL,
+        precision REAL,
+        recall REAL,
+        f1_score REAL,
+        FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
+    )
+    ''')
+    
+    # Table for feature importance
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS feature_importance (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        backtest_id INTEGER,
+        feature_name TEXT,
+        importance_value REAL,
+        FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
+    )
+    ''')
+    
+    # Table for individual trades
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        backtest_id INTEGER,
+        entry_date TEXT,
+        exit_date TEXT,
+        entry_price REAL,
+        exit_price REAL,
+        position_size REAL,
+        profit_loss REAL,
+        trade_return REAL,
+        FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
+    )
+    ''')
+    
+    # Table for WFO results
+    cursor.execute('''
+    CREATE TABLE IF NOT EXISTS wfo_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        backtest_id INTEGER,
+        window_number INTEGER,
+        train_start TEXT,
+        train_end TEXT,
+        test_start TEXT,
+        test_end TEXT,
+        accuracy REAL,
+        strategy_return REAL,
+        buy_hold_return REAL,
+        win_rate REAL,
+        trades INTEGER,
+        FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
+    )
+    ''')
+    
+    conn.commit()
+
+def save_backtest_results(backtest_obj):
+    """Save backtest results to database"""
+    try:
+        with get_db_connection('ai_backtest') as conn:
+            # Initialize tables if they don't exist
+            initialize_backtest_tables(conn)
+            
+            # Extract backtest results
+            results = backtest_obj.backtest_results
+            
+            # Insert backtest results
+            cursor = conn.cursor()
+            cursor.execute('''
+            INSERT INTO backtest_results 
+            (symbol, granularity, start_date, end_date, initial_capital, 
+            final_value, total_return, annualized_return, sharpe_ratio, 
+            max_drawdown, total_trades, win_rate, timestamp)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
+            ''', (
+                backtest_obj.symbol,
+                backtest_obj.granularity,
+                str(backtest_obj.backtest_data.index[0]),
+                str(backtest_obj.backtest_data.index[-1]),
+                results['Initial Capital'],
+                results['Final Value'],
+                results['Total Return (%)'],
+                results['Annualized Return (%)'],
+                results['Sharpe Ratio'],
+                results['Max Drawdown (%)'],
+                results['Total Trades'],
+                results['Win Rate (%)']
+            ))
+            
+            # Get the ID of the inserted backtest
+            backtest_id = cursor.lastrowid
+            
+            # Save feature importance
+            for _, row in backtest_obj.feature_importance.iterrows():
+                cursor.execute('''
+                INSERT INTO feature_importance (backtest_id, feature_name, importance_value)
+                VALUES (?, ?, ?)
+                ''', (
+                    backtest_id,
+                    row['Feature'],
+                    row['Importance']
+                ))
+            
+            # Extract and save individual trades
+            if hasattr(backtest_obj, 'backtest_data'):
+                # Find buy and sell signals
+                df = backtest_obj.backtest_data
+                buy_signals = df[df['position'] > df['position'].shift(1)]
+                sell_signals = df[df['position'] < df['position'].shift(1)]
+                
+                # Match buy and sell signals to create trade records
+                if len(buy_signals) > 0 and len(sell_signals) > 0:
+                    buy_indices = buy_signals.index.tolist()
+                    sell_indices = sell_signals.index.tolist()
+                    
+                    trade_idx = 0
+                    for i, buy_date in enumerate(buy_indices):
+                        # Find the next sell after this buy
+                        matching_sells = [s for s in sell_indices if s > buy_date]
+                        if matching_sells:
+                            sell_date = matching_sells[0]
+                            
+                            # Get trade details
+                            entry_price = df.loc[buy_date, 'close']
+                            exit_price = df.loc[sell_date, 'close']
+                            position_size = df.loc[buy_date, 'holdings']
+                            profit_loss = position_size * (exit_price/entry_price - 1)
+                            trade_return = (exit_price / entry_price) - 1
+                            
+                            # Save trade
+                            cursor.execute('''
+                            INSERT INTO trades
+                            (backtest_id, entry_date, exit_date, entry_price, exit_price, 
+                            position_size, profit_loss, trade_return)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            ''', (
+                                backtest_id,
+                                str(buy_date),
+                                str(sell_date),
+                                entry_price,
+                                exit_price,
+                                position_size,
+                                profit_loss,
+                                trade_return
+                            ))
+            
+            # Save WFO results if they exist
+            if hasattr(backtest_obj, 'wfo_results') and backtest_obj.wfo_results is not None:
+                for _, row in backtest_obj.wfo_results.iterrows():
+                    cursor.execute('''
+                    INSERT INTO wfo_results
+                    (backtest_id, window_number, train_start, train_end, test_start, test_end,
+                    accuracy, strategy_return, buy_hold_return, win_rate, trades)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        backtest_id,
+                        row['Window'],
+                        str(row['Train_Start']),
+                        str(row['Train_End']),
+                        str(row['Test_Start']),
+                        str(row['Test_End']),
+                        row['Accuracy'],
+                        row['Strategy_Return'],
+                        row['Buy_Hold_Return'],
+                        row['Win_Rate'],
+                        row['Trades']
+                    ))
+            
+            conn.commit()
+            return backtest_id
+            
+    except Exception as e:
+        logger.error(f"Error saving backtest results to database: {e}")
+        import traceback
+        traceback.print_exc()
+        return None
+
+def get_backtest_results(symbol=None, granularity=None, limit=10):
+    """Retrieve backtest results from database with optional filtering"""
+    try:
+        with get_db_connection('ai_backtest') as conn:
+            query = "SELECT * FROM backtest_results"
+            params = []
+            
+            if symbol or granularity:
+                query += " WHERE"
+                
+                if symbol:
+                    query += " symbol = ?"
+                    params.append(symbol)
+                    
+                if symbol and granularity:
+                    query += " AND"
+                    
+                if granularity:
+                    query += " granularity = ?"
+                    params.append(granularity)
+            
+            query += " ORDER BY timestamp DESC LIMIT ?"
+            params.append(limit)
+            
+            results = pd.read_sql_query(query, conn, params=params)
+            return results
+            
+    except Exception as e:
+        logger.error(f"Error retrieving backtest results: {e}")
+        return pd.DataFrame()
