@@ -164,6 +164,7 @@ def heikin_ashi_transform(dict_df):
 
 def to_df(data_dict: dict):
     if not data_dict:
+        print("No data available.")
         return pd.DataFrame()  # Return empty DataFrame if data_dict is empty
     key = next(iter(data_dict))  # gets the first key
     df = pd.DataFrame(data_dict[key])  # converts to df

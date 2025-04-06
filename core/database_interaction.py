@@ -44,41 +44,84 @@ def get_historical_from_db(granularity, symbols: list = [], num_days: int = None
         symbols = utils.convert_symbols(lone_symbol=symbols)
     db_lock = Lock()
 
-    def get_connection():
-        with db_lock:
-            return sql.connect(f'{db_path}/{granularity}.db')    
-    conn = get_connection()
-    query = "SELECT name FROM sqlite_master WHERE type='table';"
-    tables = pd.read_sql_query(query, conn)
-    tables_data = {}
-    
-    for table in tables['name']:
-        clean_table_name = '-'.join(table.split('_')[:2])
+    # Ensure database path exists
+    if not os.path.exists(db_path):
+        logger.error(f"Database path {db_path} does not exist!")
+        return {}
+        
+    # Ensure the database file exists
+    db_file = f'{db_path}/{granularity}.db'
+    if not os.path.exists(db_file):
+        logger.error(f"Database file {db_file} does not exist!")
+        return {}
 
-        # If symbols are provided, skip tables that are not in the symbol list
-        if symbols and clean_table_name not in symbols:
-            continue
+    try:
+        def get_connection():
+            with db_lock:
+                return sql.connect(db_file)
+                
+        conn = get_connection()
+        query = "SELECT name FROM sqlite_master WHERE type='table';"
+        tables = pd.read_sql_query(query, conn)
+        tables_data = {}
+        
+        logger.info(f"Found {len(tables)} tables in {granularity}.db")
+        
+        if tables.empty:
+            logger.warning(f"No tables found in {granularity}.db")
+            conn.close()
+            return {}
+        
+        for table in tables['name']:
+            clean_table_name = '-'.join(table.split('_')[:2])
+            
+            # If symbols are provided, skip tables that are not in the symbol list
+            if symbols and clean_table_name not in symbols:
+                continue
 
-        # Retrieve data from the table
-        data = pd.read_sql_query(f'SELECT * FROM "{table}"', conn)
-        data['date'] = pd.to_datetime(data['date'], errors='coerce')
-        data.set_index('date', inplace=True)
+            try:
+                # Retrieve data from the table
+                data = pd.read_sql_query(f'SELECT * FROM "{table}"', conn)
+                
+                if data.empty:
+                    logger.warning(f"Table {table} is empty!")
+                    continue
+                    
+                logger.info(f"Retrieved {len(data)} rows from table {table}")
+                
+                data['date'] = pd.to_datetime(data['date'], errors='coerce')
+                data.set_index('date', inplace=True)
 
+                if num_days is not None:
+                    last_date = data.index.max()  # Find the most recent date in the dataset
+                    start_date = last_date - pd.Timedelta(days=num_days)
+                    data = data.loc[data.index >= start_date]
+                    logger.info(f"Filtered data to last {num_days} days, now have {len(data)} rows")
 
-        if num_days is not None:
-            last_date = data.index.max()  # Find the most recent date in the dataset
-            start_date = last_date - pd.Timedelta(days=num_days)
-            data = data.loc[data.index >= start_date]
+                # Store the data in the dictionary
+                if convert:
+                    tables_data[original_symbol] = data
+                else:
+                    tables_data[clean_table_name] = data
+                    
+            except Exception as e:
+                logger.error(f"Error processing table {table}: {str(e)}")
+                continue
 
-        # Store the data in the dictionary
-        if convert:
-            tables_data[original_symbol] = data
+        conn.close()
+        
+        # Validate the result
+        if not tables_data:
+            logger.warning(f"No data found for {symbols} in {granularity}.db")
         else:
-            tables_data[clean_table_name] = data
-
-    
-    conn.close()
-    return tables_data
+            for symbol, data in tables_data.items():
+                logger.info(f"Successfully retrieved {len(data)} rows for {symbol}")
+                
+        return tables_data
+        
+    except Exception as e:
+        logger.error(f"Error in get_historical_from_db: {str(e)}")
+        return {}
 
 
 def get_best_params(strategy_object, df_manager=None, live_trading=False, best_of_all_granularities=False, minimum_trades=None, with_lowest_losing_average=False):

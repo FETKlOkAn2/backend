@@ -57,8 +57,32 @@ class AIBacktestOptimizer:
         logger.info(f"Loading historical data for {symbol} ({granularity}) - {num_days} days")
         data_dict = get_historical_from_db(granularity, symbol, num_days)
         
-        if not data_dict or symbol not in data_dict:
-            raise ValueError(f"Failed to load historical data for {symbol}")
+        # Add detailed validation and error handling
+        if not data_dict:
+            logger.error(f"No data dictionary returned from database for {symbol}")
+            # Try loading a different granularity if the requested one fails
+            for alt_granularity in ['ONE_HOUR', 'THIRTY_MINUTE', 'ONE_DAY']:
+                if alt_granularity != granularity:
+                    logger.warning(f"Trying alternative granularity: {alt_granularity}")
+                    data_dict = get_historical_from_db(alt_granularity, symbol, num_days * 2)  # Double the days for lower granularity
+                    if data_dict and symbol in data_dict and not data_dict[symbol].empty:
+                        logger.info(f"Successfully loaded data from alternative granularity {alt_granularity}")
+                        self.granularity = alt_granularity  # Update the granularity to match the data
+                        break
+            
+            # If still no data, raise a more detailed error
+            if not data_dict or symbol not in data_dict:
+                raise ValueError(f"Failed to load historical data for {symbol} from any granularity. Please run the Coinbase wrapper to fetch data first.")
+        
+        # Additional check for the specific symbol
+        if symbol not in data_dict:
+            logger.error(f"Symbol {symbol} not found in data dictionary. Available symbols: {list(data_dict.keys())}")
+            raise ValueError(f"Symbol {symbol} not found in database data")
+        
+        # Check if the dataframe is empty
+        if data_dict[symbol].empty:
+            logger.error(f"Dataframe for {symbol} is empty")
+            raise ValueError(f"Empty dataframe for {symbol}. Please run the Coinbase wrapper to fetch more data.")
             
         self.data = data_dict[symbol]
         logger.info(f"Loaded {len(self.data)} data points")
@@ -78,12 +102,46 @@ class AIBacktestOptimizer:
         """
         try:
             logger.info("Preparing technical indicators and features...")
+            
+            # Validate input data
+            if self.data is None or self.data.empty:
+                logger.error("Input data is None or empty")
+                raise ValueError("No data available for feature preparation")
+                
+            # Check if input data has enough rows
+            if len(self.data) < 50:
+                logger.warning(f"Input data has only {len(self.data)} rows - may be insufficient for generating meaningful features")
+            
+            # Make a copy of the data
             df = self.data.copy()
             
+            # Verify that the dataframe has the required columns
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
+            missing_columns = [col for col in required_columns if col not in df.columns]
+            if missing_columns:
+                logger.error(f"Missing required columns in data: {missing_columns}")
+                raise ValueError(f"Input data is missing required columns: {missing_columns}")
+            
+            # Print data ranges for debugging
+            logger.info(f"Data date range: {df.index.min()} to {df.index.max()}")
+            logger.info(f"Price range: {df['close'].min():.2f} to {df['close'].max():.2f}")
+            
+            # Check for and handle NaN values in input data
+            if df.isna().any().any():
+                nan_pct = (df.isna().sum() / len(df)).max() * 100
+                logger.warning(f"Input data contains NaN values (max {nan_pct:.2f}% in a column)")
+                
+                # Fill NaN values using forward fill then backward fill
+                df = df.fillna(method='ffill').fillna(method='bfill')
+                logger.info("NaN values in input data filled")
+            
             # Calculate technical indicators
+            logger.info("Calculating technical indicators...")
+            
             # RSI - Relative Strength Index
             for period in [7, 14, 21]:
                 df[f'rsi_{period}'] = ta.RSI(df['close'], timeperiod=period)
+                logger.info(f"RSI-{period} range: {df[f'rsi_{period}'].min():.2f} to {df[f'rsi_{period}'].max():.2f}")
             
             # ADX - Average Directional Index
             for period in [14, 21]:
@@ -118,7 +176,7 @@ class AIBacktestOptimizer:
             for period in [14, 21]:
                 df[f'atr_{period}'] = ta.ATR(df['high'], df['low'], df['close'], timeperiod=period)
             
-            # Moving Averages
+            # Moving Averages - only calculate if we have enough data
             for period in [5, 10, 20, 50, 100, 200]:
                 if len(df) > period:  # Ensure enough data points
                     df[f'sma_{period}'] = ta.SMA(df['close'], timeperiod=period)
@@ -134,29 +192,43 @@ class AIBacktestOptimizer:
             # Price change features
             df['pct_change'] = df['close'].pct_change()
             for period in [1, 5, 10, 20]:
-                df[f'return_{period}d'] = df['close'].pct_change(periods=period)
+                if len(df) > period:  # Check we have enough data
+                    df[f'return_{period}d'] = df['close'].pct_change(periods=period)
             
             # Volume features
             df['volume_change'] = df['volume'].pct_change()
-            df['volume_ma_10'] = ta.SMA(df['volume'], timeperiod=10)
-            df['volume_ma_ratio'] = df['volume'] / df['volume_ma_10']
+            if len(df) > 10:  # Check we have enough data
+                df['volume_ma_10'] = ta.SMA(df['volume'], timeperiod=10)
+                df['volume_ma_ratio'] = df['volume'] / df['volume_ma_10']
             
             # Volatility
             df['high_low_range'] = (df['high'] - df['low']) / df['close']
             
             # Generate target labels with variable look-ahead
-            # The optimization will determine the best prediction horizon
+            logger.info("Generating target labels...")
             for horizon in [1, 3, 5]:
-                # 1 = price goes up, 0 = price goes down
-                df[f'target_{horizon}'] = np.where(df['close'].shift(-horizon) > df['close'], 1, 0)
+                if len(df) > horizon:  # Make sure we have enough data for the horizon
+                    # 1 = price goes up, 0 = price goes down
+                    df[f'target_{horizon}'] = np.where(df['close'].shift(-horizon) > df['close'], 1, 0)
+                    
+                    # Log class distribution
+                    class_1_pct = df[f'target_{horizon}'].mean() * 100
+                    logger.info(f"Target {horizon} distribution: {class_1_pct:.2f}% up signals")
             
-            # Drop NaN values
+            # Log feature creation statistics
+            logger.info(f"Created {len(df.columns) - len(required_columns)} features")
+            
+            # Drop NaN values resulting from indicator calculations
+            original_len = len(df)
             df = df.dropna()
+            rows_dropped = original_len - len(df)
+            if rows_dropped > 0:
+                logger.info(f"Dropped {rows_dropped} rows with NaN values from technical indicators")
             
-            # Check for NaNs
+            # Check for any remaining NaNs
             nan_cols = df.columns[df.isna().any()].tolist()
             if nan_cols:
-                logger.warning(f"NaN values found in columns: {nan_cols}")
+                logger.warning(f"NaN values still found in columns: {nan_cols}")
                 df = df.dropna()  # Ensure all NaNs are dropped
 
             # Check for infinities
@@ -170,14 +242,20 @@ class AIBacktestOptimizer:
             logger.info(f"Feature data shape after preprocessing: {df.shape}")
             if df.shape[0] < 100:
                 logger.warning(f"Very small dataset after preprocessing: only {df.shape[0]} rows")
+                
+            if df.shape[0] < 20:
+                logger.error(f"Dataset too small for meaningful analysis: {df.shape[0]} rows")
+                raise ValueError(f"Dataset too small after preprocessing: {df.shape[0]} rows. Need more historical data.")
             
             self.feature_data = df
-            logger.info(f"Feature preparation complete. Dataset shape: {df.shape}")
+            logger.info(f"Feature preparation complete. Final dataset shape: {df.shape}")
             
             return df
         
         except Exception as e:
             logger.error(f"Error preparing features: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
             raise
 
     def objective(self, trial, validation_size=0.2):
@@ -198,8 +276,8 @@ class AIBacktestOptimizer:
             df = self.feature_data.copy()
             
             # Hyperparameters for the ML model
-            n_estimators = trial.suggest_int('n_estimators', 50, 300)
-            max_depth = trial.suggest_int('max_depth', 3, 25)
+            n_estimators = trial.suggest_int('n_estimators', 100, 500)
+            max_depth = trial.suggest_int('max_depth', 5, 30)
             min_samples_split = trial.suggest_int('min_samples_split', 2, 20)
             min_samples_leaf = trial.suggest_int('min_samples_leaf', 1, 10)
             
@@ -212,13 +290,13 @@ class AIBacktestOptimizer:
             
             # Hyperparameters for prediction
             prediction_horizon = trial.suggest_categorical('prediction_horizon', [1, 3, 5])
-            # Lowered the minimum threshold to allow more trades
-            probability_threshold = trial.suggest_float('probability_threshold', 0.3, 0.8)
+            # Significantly lower probability threshold to generate more signals
+            probability_threshold = trial.suggest_float('probability_threshold', 0.1, 0.6)
             
             # Hyperparameters for trading strategy - adjusted ranges
-            position_size_pct = trial.suggest_float('position_size_pct', 0.05, 0.5)
-            stop_loss_pct = trial.suggest_float('stop_loss_pct', 0.005, 0.05)
-            take_profit_pct = trial.suggest_float('take_profit_pct', 0.01, 0.15)
+            position_size_pct = trial.suggest_float('position_size_pct', 0.1, 0.5)
+            stop_loss_pct = trial.suggest_float('stop_loss_pct', 0.01, 0.1)
+            take_profit_pct = trial.suggest_float('take_profit_pct', 0.02, 0.2)
             
             # Select target based on prediction horizon
             target_col = f'target_{prediction_horizon}'
@@ -290,12 +368,13 @@ class AIBacktestOptimizer:
             X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
             y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
             
-            # Train the model
+            # Train the model with class_weight='balanced' to handle imbalanced classes
             model = RandomForestClassifier(
                 n_estimators=n_estimators,
                 max_depth=max_depth,
                 min_samples_split=min_samples_split,
                 min_samples_leaf=min_samples_leaf,
+                class_weight='balanced',  # Add class weighting
                 random_state=42,
                 n_jobs=-1
             )
@@ -305,13 +384,13 @@ class AIBacktestOptimizer:
             # Make predictions on validation set
             val_proba = model.predict_proba(X_val)[:, 1]  # Probability of class 1 (price up)
             
-            # Check model performance
+            # Check model performance - focusing more on recall than accuracy
             val_predictions = (val_proba > 0.5).astype(int)
             val_accuracy = accuracy_score(y_val, val_predictions)
             logger.info(f"Model validation accuracy: {val_accuracy:.4f}")
             
             # If model performance is extremely poor, penalize but don't reject completely
-            if val_accuracy < 0.51:  # Barely better than random
+            if val_accuracy < 0.48:  # Lower threshold from 0.51 to 0.48
                 logger.warning(f"Model has very poor predictive power: accuracy={val_accuracy:.4f}")
                 return -5000  # Better than -99999 but still bad
             
@@ -324,6 +403,11 @@ class AIBacktestOptimizer:
             logger.info(f"Prediction stats: Count={len(backtest_df)}, "
                       f"Predicted Ups={backtest_df['prediction'].sum()}, "
                       f"Proba min={val_proba.min():.4f}, max={val_proba.max():.4f}, mean={val_proba.mean():.4f}")
+            
+            # If we're not generating any buy signals, penalize heavily
+            if backtest_df['prediction'].sum() < 5:
+                logger.warning(f"Too few buy signals generated: {backtest_df['prediction'].sum()}")
+                return -3000
             
             # Simulate trading on validation set
             initial_capital = 10000
@@ -355,8 +439,8 @@ class AIBacktestOptimizer:
                 prev_prediction = backtest_df.loc[prev_idx, 'prediction']
                 prev_proba = backtest_df.loc[prev_idx, 'prediction_proba']
                 
-                # Modified confidence check - less strict to allow more trades
-                high_confidence = prev_proba > (probability_threshold - 0.1)
+                # Much more permissive confidence threshold to generate more trades
+                high_confidence = True  # Essentially ignore confidence check
                 
                 # Copy forward capital and positions by default (will override if there's a trade)
                 backtest_df.loc[curr_idx, 'capital'] = prev_capital
@@ -413,7 +497,7 @@ class AIBacktestOptimizer:
                             'exit_type': 'take_profit'
                         })
                     
-                    # Exit based on prediction change - relaxed to only check prediction
+                    # Exit based on prediction change - always check for signal change
                     elif prev_prediction == 0:
                         # Exit at current price
                         exit_price = curr_price
@@ -436,7 +520,7 @@ class AIBacktestOptimizer:
                             'exit_type': 'signal'
                         })
                 
-                # Check for new trade entry - relaxed to only check prediction, not high confidence
+                # Check for new trade entry - always check for signal regardless of confidence
                 elif prev_prediction == 1 and not currently_in_trade:
                     # Enter new long position
                     position_size = prev_capital * position_size_pct
@@ -469,9 +553,8 @@ class AIBacktestOptimizer:
                 logger.warning(f"Probability summary: Min={backtest_df['prediction_proba'].min()}, "
                              f"Max={backtest_df['prediction_proba'].max()}, Mean={backtest_df['prediction_proba'].mean()}")
                 
-                # Instead of completely rejecting, give a very low but not worst possible score
-                # This helps optuna explore more of the parameter space
-                return -1000
+                # Heavy penalty for no trades
+                return -2000
             
             # Calculate returns and metrics
             backtest_df['daily_return'] = backtest_df['total_value'].pct_change()
@@ -516,18 +599,18 @@ class AIBacktestOptimizer:
                 sharpe_ratio = 0
             
             # Combine metrics into a single optimization score
-            # You can adjust these weights based on what's most important for your strategy
+            # Adjusted weights to focus on profitability and number of trades
             if profit_factor == 0:
                 optimization_score = -500  # Penalize but don't completely reject
             else:
                 optimization_score = (
-                    2.0 * profit_factor +          # Weight profit factor heavily
-                    1.0 * win_rate +              # Include win rate
-                    0.5 * win_loss_ratio +        # Include win/loss ratio
-                    1.0 * total_return -          # Include total return
-                    2.0 * abs(max_drawdown) +     # Penalize drawdowns
-                    1.0 * sharpe_ratio +          # Include risk-adjusted return
-                    0.2 * (len(trades_df) / 20)   # Small bonus for more trades (up to a point)
+                    3.0 * profit_factor +          # Increased weight for profit factor
+                    1.5 * win_rate +               # Increased weight for win rate
+                    0.5 * win_loss_ratio +         # Include win/loss ratio
+                    2.0 * total_return -           # Increased weight for total return
+                    1.0 * abs(max_drawdown) +      # Reduced penalty for drawdowns
+                    0.5 * sharpe_ratio +           # Include risk-adjusted return
+                    0.5 * min(len(trades_df) / 10, 3.0)  # Increased incentive for more trades
                 )
             
             # Store metrics for logging
@@ -591,7 +674,7 @@ class AIBacktestOptimizer:
             self.best_params = best_params
             
             # Save the study for future reference
-            joblib.dump(study, f"optimization_{self.symbol}_{self.granularity}.pkl")
+            joblib.dump(study, f"core/ai/models/optimization_{self.symbol}_{self.granularity}.pkl")
             
             return best_params
             
@@ -674,17 +757,21 @@ class AIBacktestOptimizer:
                              ['open', 'high', 'low', 'close', 'volume'] + 
                              [f'target_{h}' for h in [1, 3, 5]]]
             
+            # Log selected features for debugging
+            logger.info(f"Selected {len(feature_cols)} features for final model: {feature_cols[:10]}...")
+            
             # Use full dataset for training (to get the most data)
             full_df = self.feature_data.copy()
             X_full = full_df[feature_cols]
             y_full = full_df[target_col]
             
-            # Train the model on full dataset
+            # Train the model on full dataset with class_weight='balanced'
             model = RandomForestClassifier(
                 n_estimators=n_estimators,
                 max_depth=max_depth,
                 min_samples_split=min_samples_split,
                 min_samples_leaf=min_samples_leaf,
+                class_weight='balanced',  # Add class weighting
                 random_state=42,
                 n_jobs=-1
             )
@@ -698,6 +785,11 @@ class AIBacktestOptimizer:
                 'Importance': model.feature_importances_
             }).sort_values('Importance', ascending=False)
             
+            # Log feature importance
+            logger.info("Top 10 important features:")
+            for _, row in feature_importance.head(10).iterrows():
+                logger.info(f"{row['Feature']}: {row['Importance']:.4f}")
+            
             # Make predictions on test data
             X_test = df[feature_cols]
             test_proba = model.predict_proba(X_test)[:, 1]
@@ -706,6 +798,10 @@ class AIBacktestOptimizer:
             backtest_df = df.copy()
             backtest_df['prediction_proba'] = test_proba
             backtest_df['prediction'] = (test_proba > probability_threshold).astype(int)
+            
+            # Log prediction distribution
+            logger.info(f"Prediction distribution: Predicted buys={backtest_df['prediction'].sum()}, "
+                       f"Total rows={len(backtest_df)}, Buy percentage={backtest_df['prediction'].mean()*100:.2f}%")
             
             # Simulate trading
             initial_capital = 10000
@@ -736,7 +832,9 @@ class AIBacktestOptimizer:
                 curr_price = backtest_df.loc[curr_idx, 'close']
                 prev_prediction = backtest_df.loc[prev_idx, 'prediction']
                 prev_proba = backtest_df.loc[prev_idx, 'prediction_proba']
-                high_confidence = prev_proba > probability_threshold or prev_proba < (1 - probability_threshold)
+                
+                # Make confidence check more permissive to generate more trades
+                high_confidence = True  # Don't filter on confidence
                 
                 # Copy forward capital and positions by default (will override if there's a trade)
                 backtest_df.loc[curr_idx, 'capital'] = prev_capital
@@ -769,6 +867,8 @@ class AIBacktestOptimizer:
                             'return': trade_return,
                             'exit_type': 'stop_loss'
                         })
+                        
+                        logger.info(f"Stop-loss exit: {curr_idx}, Entry: {trade_entry_price:.2f}, Exit: {exit_price:.2f}, Return: {trade_return*100:.2f}%")
                     
                     # Check if take-profit was hit
                     elif backtest_df.loc[curr_idx, 'high'] >= curr_target:
@@ -792,9 +892,11 @@ class AIBacktestOptimizer:
                             'return': trade_return,
                             'exit_type': 'take_profit'
                         })
+                        
+                        logger.info(f"Take-profit exit: {curr_idx}, Entry: {trade_entry_price:.2f}, Exit: {exit_price:.2f}, Return: {trade_return*100:.2f}%")
                     
-                    # Exit based on prediction change
-                    elif prev_prediction == 0 and high_confidence:
+                    # Exit based on prediction change - always check regardless of confidence
+                    elif prev_prediction == 0:
                         # Exit at current price
                         exit_price = curr_price
                         currently_in_trade = False
@@ -815,9 +917,11 @@ class AIBacktestOptimizer:
                             'return': trade_return,
                             'exit_type': 'signal'
                         })
+                        
+                        logger.info(f"Signal exit: {curr_idx}, Entry: {trade_entry_price:.2f}, Exit: {exit_price:.2f}, Return: {trade_return*100:.2f}%")
                 
-                # Check for new trade entry
-                elif prev_prediction == 1 and high_confidence and not currently_in_trade:
+                # Check for new trade entry - always check regardless of confidence
+                elif prev_prediction == 1 and not currently_in_trade:
                     # Enter new long position
                     position_size = prev_capital * position_size_pct
                     shares_bought = position_size / curr_price
@@ -836,6 +940,8 @@ class AIBacktestOptimizer:
                     backtest_df.loc[curr_idx, 'profit_target'] = profit_target
                     
                     currently_in_trade = True
+                    
+                    logger.info(f"Trade entry: {curr_idx}, Price: {trade_entry_price:.2f}, Stop: {stop_level:.2f}, Target: {profit_target:.2f}")
                 
                 # Update holdings and total value
                 backtest_df.loc[curr_idx, 'holdings'] = backtest_df.loc[curr_idx, 'position'] * curr_price
@@ -934,7 +1040,7 @@ class AIBacktestOptimizer:
             return
             
         if filename is None:
-            filename = f"model_{self.symbol}_{self.granularity}_{datetime.now().strftime('%Y%m%d')}.pkl"
+            filename = f"core/ai/models/model_{self.symbol}_{self.granularity}_{datetime.now().strftime('%Y%m%d')}.pkl"
             
         logger.info(f"Saving model to {filename}")
         joblib.dump(self.best_model, filename)
@@ -1080,7 +1186,7 @@ def main():
         
         # Plot results if requested
         if args.plot:
-            plot_path = f"backtest_{args.symbol}_{args.granularity}.png" if args.save else None
+            plot_path = f"core/ai/img/backtest_{args.symbol}_{args.granularity}.png" if args.save else None
             optimizer.plot_backtest_results(backtest_df, save_path=plot_path)
         
         # Save model if requested

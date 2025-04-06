@@ -1,0 +1,16 @@
+{
+    "n_estimators": 229,
+    "max_depth": 13,
+    "min_samples_split": 5,
+    "min_samples_leaf": 9,
+    "rsi_period": 7,
+    "sma_fast": 20,
+    "sma_slow": 50,
+    "macd_fast": 12,
+    "macd_slow": 26,
+    "prediction_horizon": 1,
+    "probability_threshold": 0.34879495339727673,
+    "position_size_pct": 0.2434507550877598,
+    "stop_loss_pct": 0.04727895771141936,
+    "take_profit_pct": 0.06184841806197294
+}

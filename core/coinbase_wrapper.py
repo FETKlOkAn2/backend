@@ -21,14 +21,27 @@ class Coinbase_Wrapper():
         
         self.socketio = socketio
 
-        self.db_path = os.getenv('DATABASE_PATH')
+        self.db_path = os.getenv('DATABASE_PATH', 'database')  # Default to 'database' if not set
         self.api_key = os.getenv('DOTENV_API_KEY_COINBASE')
         self.api_secret = os.getenv('DOTENV_API_PRIVATE_KEY_COINBASE')
 
-        print("API KEY COINBASE :",self.api_key)
-        print("API SECRET COINBASE :",self.api_secret)
-        self.client = RESTClient(api_key=self.api_key, api_secret=self.api_secret)
+        print("DATABASE_PATH:", self.db_path)
+        print("API KEY COINBASE:", self.api_key)
+        print("API SECRET COINBASE:", self.api_secret)
+        
+        # Create a client - use direct API access if keys are not available
+        if self.api_key and self.api_secret:
+            self.client = RESTClient(api_key=self.api_key, api_secret=self.api_secret)
+        else:
+            print("Warning: API keys not set, using unauthenticated client")
+            self.client = RESTClient()
+            
         self.coinbase_robin_crypto = ['BTC-USD', 'ETH-USD', 'DOGE-USD', 'SHIB-USD', 'AVAX-USD', 'BCH-USD', 'LINK-USD', 'UNI-USD', 'LTC-USD', 'XLM-USD', 'ETC-USD', 'AAVE-USD', 'XTZ-USD', 'COMP-USD']
+        
+        # Create database directory if it doesn't exist
+        if not os.path.exists(self.db_path):
+            os.makedirs(self.db_path)
+            print(f"Created database directory: {self.db_path}")
 
     
     def _get_unix_times(self, granularity: str, days: int = 1):
@@ -108,30 +121,82 @@ class Coinbase_Wrapper():
 
     def _fetch_data(self, symbol, start_unix, end_unix, granularity):
         max_retries = 4
-
+        
+        # Convert Unix timestamps to readable dates for better debugging
+        start_date = dt.datetime.fromtimestamp(start_unix)
+        end_date = dt.datetime.fromtimestamp(end_unix)
+        print(f"Attempting to fetch {symbol} data from {start_date} to {end_date}")
+        
         for attempt in range(10):
             try:
-                btc_candles = self.client.get_candles(
+                response = self.client.get_candles(
                     product_id=symbol,
-                    start=start_unix,
-                    end=end_unix,
+                    start=str(start_unix),
+                    end=str(end_unix),
                     granularity=granularity
                 )
-                # Convert the response to a DataFrame
-                df = utils.to_df(btc_candles)
-                return df
-
-            except RequestException as e:
-                print(f"Attempt {attempt + 1} failed: {e}")
-                if attempt < max - 1:
-                    time.sleep(2 ** attempt)  # Exponential backoff
+                
+                # Debug the response structure
+                print(f"Response type: {type(response)}")
+                if hasattr(response, 'candles'):
+                    print(f"Number of candles: {len(response.candles)}")
+                    if response.candles:
+                        # Print the first candle to see its structure
+                        print(f"First candle structure: {type(response.candles[0])}")
+                        print(f"First candle data: {response.candles[0]}")
                 else:
-                    print("All retry attempts failed.")
-                    raise
-
+                    print("Response has no 'candles' attribute")
+                    print(f"Response attributes: {dir(response)}")
+                
+                # Now let's create a DataFrame directly from the response
+                if hasattr(response, 'candles') and response.candles:
+                    # Create a list of dictionaries from the candles
+                    candle_data = []
+                    for candle in response.candles:
+                        # Extract data from the candle object - adjust this based on the actual structure
+                        candle_dict = {
+                            'start': getattr(candle, 'start', None),
+                            'low': getattr(candle, 'low', None),
+                            'high': getattr(candle, 'high', None),
+                            'open': getattr(candle, 'open', None),
+                            'close': getattr(candle, 'close', None),
+                            'volume': getattr(candle, 'volume', None)
+                        }
+                        candle_data.append(candle_dict)
+                    
+                    # Create DataFrame directly
+                    df = pd.DataFrame(candle_data)
+                    
+                    if not df.empty:
+                        # Process the date column
+                        df['start'] = pd.to_datetime(df['start'].astype(float), unit='s')
+                        df = df.rename(columns={'start': 'date'})
+                        
+                        # Convert numeric columns
+                        for col in ['low', 'high', 'open', 'close', 'volume']:
+                            df[col] = pd.to_numeric(df[col], errors='coerce')
+                        
+                        # Fill forward any missing values
+                        df = df.ffill()
+                        
+                        print(f"Successfully created DataFrame with {len(df)} rows")
+                        return df
+                    else:
+                        print(f"No data found for {symbol} in time range")
+                        return pd.DataFrame()
+                else:
+                    print(f"No valid candles data found for {symbol}")
+                    return pd.DataFrame()
+                
+            except RequestException as e:
+                print(f"RequestException: {e}")
+            
             except Exception as e:
-                print(f"Unexpected error: {e}")
-                raise
+                print(f"Unexpected error fetching data for {symbol}: {e}")
+                print(f"Error type: {type(e)}")
+                import traceback
+                traceback.print_exc()
+                return pd.DataFrame()
 
 
     def _get_missing_unix_range(self, desired_start_unix, desired_end_unix, existing_start_unix, existing_end_unix):
@@ -159,7 +224,24 @@ class Coinbase_Wrapper():
 
     def get_candles_for_db(self, symbols: list, granularity: str, days: int = 1, callback=None, socketio=None):
         """Fetch candles and send real-time progress to frontend."""
+        if not symbols:
+            print("No symbols provided.")
+            return
+            
+        # Make sure database directory exists
+        if not os.path.exists(self.db_path):
+            os.makedirs(self.db_path)
+            print(f"Created database directory: {self.db_path}")
+            
+        # Generate time ranges to fetch
         timestamps = self._get_unix_times(granularity, days=days)
+        print(f"Generated {len(timestamps)} time ranges to fetch")
+        
+        # Print example time range for debugging
+        if timestamps:
+            start_time = dt.datetime.fromtimestamp(timestamps[0][0])
+            end_time = dt.datetime.fromtimestamp(timestamps[0][1])
+            print(f"Example time range: {start_time} to {end_time}")
 
         for symbol in symbols:
             if callback:
@@ -167,40 +249,68 @@ class Coinbase_Wrapper():
             if socketio:
                 socketio.emit("log_update", {"message": f"Fetching data for {symbol}"})
             print(f"\nFetching data for {symbol}")
+            
+            # Initialize combined dataframe
             combined_df = pd.DataFrame()
+            
+            # Get existing data from database
             existing_data = self._get_data_from_db(symbol, granularity)
 
             if not existing_data.empty:
+                print(f"Found existing data for {symbol} with {len(existing_data)} rows")
                 existing_start_unix = int(existing_data.index.min().timestamp())
                 existing_end_unix = int(existing_data.index.max().timestamp())
+                print(f"Existing data range: {dt.datetime.fromtimestamp(existing_start_unix)} to {dt.datetime.fromtimestamp(existing_end_unix)}")
             else:
+                print(f"No existing data found for {symbol}")
                 existing_start_unix = None
                 existing_end_unix = None
 
-            missing_date_ranges:list = []
+            # Determine which time ranges we need to fetch
+            missing_date_ranges = []
             for desired_start_unix, desired_end_unix in timestamps:
-                missing_ranges = self._get_missing_unix_range(
-                    desired_start_unix, desired_end_unix, existing_start_unix, existing_end_unix
-                ) if existing_start_unix is not None and existing_end_unix is not None else [(desired_start_unix, desired_end_unix)]
+                # Find what data is missing
+                if existing_start_unix is not None and existing_end_unix is not None:
+                    missing_ranges = self._get_missing_unix_range(
+                        desired_start_unix, desired_end_unix, existing_start_unix, existing_end_unix
+                    )
+                else:
+                    missing_ranges = [(desired_start_unix, desired_end_unix)]
 
                 missing_date_ranges.extend(missing_ranges)
 
             if not missing_date_ranges:
+                print(f"All data for {symbol} is already up to date.")
                 if socketio:
                     socketio.emit("log_update", {"message": f"All data for {symbol} is already up to date."})
                 continue
 
+            print(f"Need to fetch {len(missing_date_ranges)} time ranges for {symbol}")
+            
+            # Fetch the missing data
             data_found = False
             start_time = time.time()
 
             for i, missing_range in enumerate(missing_date_ranges):
                 start_unix, end_unix = missing_range
+                
+                # Print human-readable dates for debugging
+                start_date = dt.datetime.fromtimestamp(start_unix)
+                end_date = dt.datetime.fromtimestamp(end_unix)
+                print(f"Fetching range {i+1}/{len(missing_date_ranges)}: {start_date} to {end_date}")
+                
+                # Fetch the data
                 df = self._fetch_data(symbol, start_unix, end_unix, granularity)
 
                 if not df.empty:
+                    rows_fetched = len(df)
+                    # print(f"Fetched {rows_fetched} rows for {symbol}")
                     data_found = True
                     combined_df = pd.concat([combined_df, df], ignore_index=True)
+                else:
+                    print(f"No data found for {symbol} in time range")
 
+                # Update progress
                 utils.progress_bar_with_eta(i, missing_date_ranges, start_time, self.socketio, symbol)
                 percent = int(((i + 1) / len(missing_date_ranges)) * 100)
                 eta = (time.time() - start_time) / (i + 1) * (len(missing_date_ranges) - (i + 1))
@@ -212,24 +322,49 @@ class Coinbase_Wrapper():
                         "eta": f"{eta_minutes:02d}:{eta_seconds:02d}"
                     })
 
-            if data_found:
+            # Process and save the fetched data
+            if data_found and not combined_df.empty:
+                # print(f"Processing {len(combined_df)} rows of data for {symbol}")
+                
+                # Sort, convert numeric columns, and remove duplicates
                 sorted_df = combined_df.sort_values(by="date", ascending=True).reset_index(drop=True)
                 columns_to_convert = ['low', 'high', 'open', 'close', 'volume']
                 for col in columns_to_convert:
                     sorted_df[col] = pd.to_numeric(sorted_df[col], errors='coerce')
+                
+                # Handle potential NaN values
+                if sorted_df.isna().any().any():
+                    # print(f"Warning: NaN values found in {symbol} data. Filling with interpolation.")
+                    sorted_df = sorted_df.interpolate(method='linear')
+                
                 sorted_df.set_index("date", inplace=True)
                 sorted_df = sorted_df[~sorted_df.index.duplicated(keep="first")]
+                
+                # Add data from existing database if available
+                if not existing_data.empty:
+                    # print(f"Merging with {len(existing_data)} existing rows of data")
+                    sorted_df = pd.concat([existing_data, sorted_df])
+                    sorted_df = sorted_df[~sorted_df.index.duplicated(keep="last")]  # Keep latest data
+                    sorted_df = sorted_df.sort_index()
+                
                 combined_data = {symbol: sorted_df}
-
+                
+                # print(f"Saving {len(sorted_df)} rows of data for {symbol}")
                 if socketio:
                     socketio.emit("log_update", {"message": f"Saving data for {symbol}"})
+                
+                # Save to database
                 database_interaction.export_historical_to_db(combined_data, granularity=granularity)
+                print(f"Data saved successfully for {symbol}")
             else:
+                # print(f"No new data found for {symbol}")
                 if socketio:
                     socketio.emit("log_update", {"message": f"No new data available for {symbol}."})
 
-        # Resample data in the database
+        # Resample data in the database to create higher timeframes
+        print("\nResampling data to higher timeframes...")
         database_interaction.resample_dataframe_from_db(granularity=granularity, callback=callback, socketio=self.socketio)
+        print("Resampling completed.")
         if socketio:
             socketio.emit("log_update", {"message": "Resampling database completed."})
 
@@ -325,14 +460,27 @@ class Coinbase_Wrapper():
             combined_data[symbol] = combined_df
         return combined_data
                 
+def debug_times():
+    timestamps = coinbase._get_unix_times('ONE_MINUTE', days=10)
+    print(f"Number of time ranges: {len(timestamps)}")
+    for i, (start, end) in enumerate(timestamps[:3]):  # Print first 3 for debugging
+        start_dt = dt.datetime.fromtimestamp(start)
+        end_dt = dt.datetime.fromtimestamp(end)
+        print(f"Range {i}: {start_dt} to {end_dt} (duration: {(end_dt - start_dt).total_seconds()/3600} hours)")
+    
+    # Calculate total time span
+    if timestamps:
+        overall_start = dt.datetime.fromtimestamp(timestamps[0][0])
+        overall_end = dt.datetime.fromtimestamp(timestamps[-1][1])
+        print(f"Total span: {overall_start} to {overall_end} ({(overall_end - overall_start).days} days)")
 
 
 
-# granularity = 'ONE_MINUTE'
-# coinbase = Coinbase_Wrapper()
-
-# coinbase.get_candles_for_db(
-#     symbols=coinbase.coinbase_robin_crypto,
-#     granularity=granularity,
-#     days=365
-#     )
+coinbase = Coinbase_Wrapper()
+debug_times()
+granularity = 'ONE_MINUTE'
+coinbase.get_candles_for_db(
+    symbols=coinbase.coinbase_robin_crypto,
+    granularity=granularity,
+    days=700
+    )
