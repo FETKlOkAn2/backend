@@ -319,13 +319,15 @@ def get_users():
     conn.close()
     users_dict = dict(zip(users['email'], users['password']))
     return users_dict
-def save_user(email, password):
-    _create_table_if_not_exists('users', pd.DataFrame(columns=['email', 'password']), sql.connect(f'{db_path}/users.db'))
+def save_user(email, password, privacy_policy_accepted=False, api_key=None):
+    _create_table_if_not_exists('users', pd.DataFrame(columns=['email', 'password', 'privacy_policy_accepted', 'api_key']), sql.connect(f'{db_path}/users.db'))
     conn = sql.connect(f'{db_path}/users.db')
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO users (email, password) VALUES (?, ?);", (email, password))
+    cursor.execute("INSERT INTO users (email, password, privacy_policy_accepted, api_key) VALUES (?, ?, ?, ?);", (email, password, privacy_policy_accepted, api_key))
     conn.commit()
     conn.close()
+
+save_user("test_user", "test_password")
 def get_backtest_history(email):
     _create_table_if_not_exists('backtests', pd.DataFrame(columns=['email', 'symbol', 'strategy', 'result', 'date']), sql.connect(f'{db_path}/backtests.db'))
     conn = sql.connect(f'{db_path}/backtests.db')

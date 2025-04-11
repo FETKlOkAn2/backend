@@ -306,7 +306,7 @@ class Strategy:
 
         if self.with_sizing:
             size = pd.Series(index=self.close.index, dtype='float')
-            size[self.entries] = self.risk_object.percent_to_size #this sizing will be calculated through risk class
+            size[self.entries] = self.risk_object.risk_percent #this sizing will be calculated through risk class
             size[self.exits] = np.inf
 
             size_type = 'value'

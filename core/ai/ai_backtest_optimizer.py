@@ -88,7 +88,12 @@ class AIBacktestOptimizer:
         logger.info(f"Loaded {len(self.data)} data points")
         
         # Initialize risk handler
-        self.risk_handler = Risk_Handler()
+        self.risk_handler = Risk_Handler(
+            client=None,  # No client needed for backtest
+            risk_percent=0.02,  # Default risk per trade
+            max_drawdown=0.15,  # Default max drawdown
+            max_open_trades=3   # Default max open trades
+        )
         
         # Initialize storage for feature data
         self.feature_data = None
@@ -260,14 +265,15 @@ class AIBacktestOptimizer:
 
     def objective(self, trial, validation_size=0.2):
         """
-        Objective function for Optuna to optimize
+        Objective function for Optuna to optimize - improved version with better default parameters
+        and more realistic trading simulation
         
         Args:
             trial: Optuna trial object
             validation_size: Size of validation dataset
             
         Returns:
-            float: Metric to optimize (e.g., profit factor or Sharpe ratio)
+            float: Metric to optimize (profit factor or composite score)
         """
         try:
             if self.feature_data is None:
@@ -275,11 +281,11 @@ class AIBacktestOptimizer:
                 
             df = self.feature_data.copy()
             
-            # Hyperparameters for the ML model
+            # Hyperparameters for the ML model - adjusted ranges
             n_estimators = trial.suggest_int('n_estimators', 100, 500)
-            max_depth = trial.suggest_int('max_depth', 5, 30)
-            min_samples_split = trial.suggest_int('min_samples_split', 2, 20)
-            min_samples_leaf = trial.suggest_int('min_samples_leaf', 1, 10)
+            max_depth = trial.suggest_int('max_depth', 4, 15)  # Reduced max depth to prevent overfitting
+            min_samples_split = trial.suggest_int('min_samples_split', 5, 30)  # Increased to reduce overfitting
+            min_samples_leaf = trial.suggest_int('min_samples_leaf', 5, 30)  # Increased to reduce overfitting
             
             # Hyperparameters for feature selection
             rsi_period = trial.suggest_categorical('rsi_period', [7, 14, 21])
@@ -290,13 +296,19 @@ class AIBacktestOptimizer:
             
             # Hyperparameters for prediction
             prediction_horizon = trial.suggest_categorical('prediction_horizon', [1, 3, 5])
-            # Significantly lower probability threshold to generate more signals
-            probability_threshold = trial.suggest_float('probability_threshold', 0.1, 0.6)
+            # Higher probability threshold to get more confident predictions
+            probability_threshold = trial.suggest_float('probability_threshold', 0.55, 0.85)
             
-            # Hyperparameters for trading strategy - adjusted ranges
-            position_size_pct = trial.suggest_float('position_size_pct', 0.1, 0.5)
-            stop_loss_pct = trial.suggest_float('stop_loss_pct', 0.01, 0.1)
-            take_profit_pct = trial.suggest_float('take_profit_pct', 0.02, 0.2)
+            # Hyperparameters for trading strategy - adjusted ranges for minute data
+            position_size_pct = trial.suggest_float('position_size_pct', 0.01, 0.10)  # Smaller positions
+            stop_loss_pct = trial.suggest_float('stop_loss_pct', 0.005, 0.03)  # Tighter stops
+            take_profit_pct = trial.suggest_float('take_profit_pct', 0.01, 0.05)  # More realistic targets
+            
+            # New parameters for trade management
+            max_trade_duration = trial.suggest_int('max_trade_duration', 10, 200)  # Max minutes in trade
+            trailing_stop = trial.suggest_categorical('trailing_stop', [True, False])
+            trailing_stop_activation = trial.suggest_float('trailing_stop_activation', 0.005, 0.02)
+            trailing_stop_distance = trial.suggest_float('trailing_stop_distance', 0.002, 0.01)
             
             # Select target based on prediction horizon
             target_col = f'target_{prediction_horizon}'
@@ -317,7 +329,7 @@ class AIBacktestOptimizer:
                 elif 'return_' in col or 'volume_' in col or col == 'high_low_range':
                     feature_cols.append(col)
             
-            # Ensure we have sufficient features with improved selection logic
+            # Ensure we have sufficient features
             if len(feature_cols) < 5:
                 # More structured approach to feature selection
                 core_features = []
@@ -384,15 +396,15 @@ class AIBacktestOptimizer:
             # Make predictions on validation set
             val_proba = model.predict_proba(X_val)[:, 1]  # Probability of class 1 (price up)
             
-            # Check model performance - focusing more on recall than accuracy
+            # Check model performance
             val_predictions = (val_proba > 0.5).astype(int)
             val_accuracy = accuracy_score(y_val, val_predictions)
             logger.info(f"Model validation accuracy: {val_accuracy:.4f}")
             
             # If model performance is extremely poor, penalize but don't reject completely
-            if val_accuracy < 0.48:  # Lower threshold from 0.51 to 0.48
-                logger.warning(f"Model has very poor predictive power: accuracy={val_accuracy:.4f}")
-                return -5000  # Better than -99999 but still bad
+            if val_accuracy < 0.51:
+                logger.warning(f"Model has poor predictive power: accuracy={val_accuracy:.4f}")
+                return -100  # Less severe penalty
             
             # Create a copy of validation data for backtest simulation
             backtest_df = df.iloc[split_idx:].copy()
@@ -401,13 +413,17 @@ class AIBacktestOptimizer:
             
             # Log distribution of predictions and probabilities
             logger.info(f"Prediction stats: Count={len(backtest_df)}, "
-                      f"Predicted Ups={backtest_df['prediction'].sum()}, "
-                      f"Proba min={val_proba.min():.4f}, max={val_proba.max():.4f}, mean={val_proba.mean():.4f}")
+                    f"Predicted Ups={backtest_df['prediction'].sum()}, "
+                    f"Proba min={val_proba.min():.4f}, max={val_proba.max():.4f}, mean={val_proba.mean():.4f}")
             
-            # If we're not generating any buy signals, penalize heavily
-            if backtest_df['prediction'].sum() < 5:
+            # If we're generating too few or too many buy signals, penalize (but not as severely)
+            if backtest_df['prediction'].sum() < 10:
                 logger.warning(f"Too few buy signals generated: {backtest_df['prediction'].sum()}")
-                return -3000
+                return -50
+            
+            if backtest_df['prediction'].sum() > len(backtest_df) * 0.5:  # More than 50% buy signals
+                logger.warning(f"Too many buy signals: {backtest_df['prediction'].sum()} of {len(backtest_df)}")
+                return -30
             
             # Simulate trading on validation set
             initial_capital = 10000
@@ -419,12 +435,21 @@ class AIBacktestOptimizer:
             backtest_df['total_value'] = float(initial_capital)
             backtest_df['stop_level'] = 0.0
             backtest_df['profit_target'] = 0.0
+            backtest_df['trailing_stop_level'] = 0.0
             
             # Trading simulation
             trades = []
             currently_in_trade = False
             trade_entry_price = 0
             trade_entry_idx = None
+            trade_highest_price = 0  # For trailing stop
+            trade_duration = 0  # For tracking how long in trade
+            
+            # Enhanced slippage model (especially important for high-frequency crypto)
+            def apply_slippage(price, is_buy):
+                # Higher slippage for crypto minute data
+                slippage_bps = 20  # 0.2% slippage
+                return price * (1 + slippage_bps/10000) if is_buy else price * (1 - slippage_bps/10000)
             
             # Loop through the validation data (starting from second row)
             for i in range(1, len(backtest_df)):
@@ -439,22 +464,33 @@ class AIBacktestOptimizer:
                 prev_prediction = backtest_df.loc[prev_idx, 'prediction']
                 prev_proba = backtest_df.loc[prev_idx, 'prediction_proba']
                 
-                # Much more permissive confidence threshold to generate more trades
-                high_confidence = True  # Essentially ignore confidence check
-                
                 # Copy forward capital and positions by default (will override if there's a trade)
                 backtest_df.loc[curr_idx, 'capital'] = prev_capital
                 backtest_df.loc[curr_idx, 'position'] = prev_position
                 
                 # Check for trade exit based on stop-loss or take-profit
                 if currently_in_trade:
+                    trade_duration += 1
                     curr_stop = backtest_df.loc[prev_idx, 'stop_level']
                     curr_target = backtest_df.loc[prev_idx, 'profit_target']
                     
+                    # Update highest price seen during trade for trailing stop
+                    if trailing_stop and curr_price > trade_highest_price:
+                        trade_highest_price = curr_price
+                        
+                        # Only activate trailing stop after price has moved in favor by activation amount
+                        if (trade_highest_price / trade_entry_price - 1) >= trailing_stop_activation:
+                            # Update trailing stop level
+                            new_stop = trade_highest_price * (1 - trailing_stop_distance)
+                            # Only move stop up, never down
+                            if new_stop > curr_stop:
+                                curr_stop = new_stop
+                                backtest_df.loc[curr_idx, 'stop_level'] = curr_stop
+                    
                     # Check if stop-loss was hit
                     if backtest_df.loc[curr_idx, 'low'] <= curr_stop:
-                        # Exit at stop price
-                        exit_price = curr_stop
+                        # Exit at stop price with slippage
+                        exit_price = apply_slippage(curr_stop, False)
                         currently_in_trade = False
                         
                         # Calculate position value and update capital
@@ -471,13 +507,16 @@ class AIBacktestOptimizer:
                             'entry_price': trade_entry_price,
                             'exit_price': exit_price,
                             'return': trade_return,
-                            'exit_type': 'stop_loss'
+                            'exit_type': 'stop_loss',
+                            'duration': trade_duration
                         })
+                        trade_duration = 0
+                        trade_highest_price = 0
                     
                     # Check if take-profit was hit
                     elif backtest_df.loc[curr_idx, 'high'] >= curr_target:
-                        # Exit at target price
-                        exit_price = curr_target
+                        # Exit at target price with slippage
+                        exit_price = apply_slippage(curr_target, False)
                         currently_in_trade = False
                         
                         # Calculate position value and update capital
@@ -494,13 +533,16 @@ class AIBacktestOptimizer:
                             'entry_price': trade_entry_price,
                             'exit_price': exit_price,
                             'return': trade_return,
-                            'exit_type': 'take_profit'
+                            'exit_type': 'take_profit',
+                            'duration': trade_duration
                         })
+                        trade_duration = 0
+                        trade_highest_price = 0
                     
-                    # Exit based on prediction change - always check for signal change
+                    # Exit based on prediction change
                     elif prev_prediction == 0:
-                        # Exit at current price
-                        exit_price = curr_price
+                        # Exit at current price with slippage
+                        exit_price = apply_slippage(curr_price, False)
                         currently_in_trade = False
                         
                         # Calculate position value and update capital
@@ -517,20 +559,52 @@ class AIBacktestOptimizer:
                             'entry_price': trade_entry_price,
                             'exit_price': exit_price,
                             'return': trade_return,
-                            'exit_type': 'signal'
+                            'exit_type': 'signal',
+                            'duration': trade_duration
                         })
+                        trade_duration = 0
+                        trade_highest_price = 0
+                    
+                    # Check for max trade duration
+                    elif trade_duration >= max_trade_duration:
+                        # Exit at current price with slippage
+                        exit_price = apply_slippage(curr_price, False)
+                        currently_in_trade = False
+                        
+                        # Calculate position value and update capital
+                        position_value = prev_position * exit_price
+                        backtest_df.loc[curr_idx, 'capital'] = prev_capital + position_value
+                        backtest_df.loc[curr_idx, 'position'] = 0
+                        backtest_df.loc[curr_idx, 'exit_price'] = exit_price
+                        
+                        # Record trade
+                        trade_return = (exit_price / trade_entry_price) - 1
+                        trades.append({
+                            'entry_date': backtest_df.index[trade_entry_idx],
+                            'exit_date': curr_idx,
+                            'entry_price': trade_entry_price,
+                            'exit_price': exit_price,
+                            'return': trade_return,
+                            'exit_type': 'time_limit',
+                            'duration': trade_duration
+                        })
+                        trade_duration = 0
+                        trade_highest_price = 0
                 
-                # Check for new trade entry - always check for signal regardless of confidence
-                elif prev_prediction == 1 and not currently_in_trade:
+                # Check for new trade entry - now with confidence requirement
+                elif prev_prediction == 1 and not currently_in_trade and prev_proba >= probability_threshold:
                     # Enter new long position
                     position_size = prev_capital * position_size_pct
-                    shares_bought = position_size / curr_price
-                    trade_entry_price = curr_price
+                    # Apply slippage to entry price
+                    entry_price = apply_slippage(curr_price, True)
+                    shares_bought = position_size / entry_price
+                    trade_entry_price = entry_price
                     trade_entry_idx = i
+                    trade_highest_price = entry_price
                     
                     # Set stop-loss and take-profit levels
-                    stop_level = curr_price * (1 - stop_loss_pct)
-                    profit_target = curr_price * (1 + take_profit_pct)
+                    stop_level = entry_price * (1 - stop_loss_pct)
+                    profit_target = entry_price * (1 + take_profit_pct)
                     
                     # Update position and capital
                     backtest_df.loc[curr_idx, 'capital'] = prev_capital - position_size
@@ -545,18 +619,60 @@ class AIBacktestOptimizer:
                 backtest_df.loc[curr_idx, 'holdings'] = backtest_df.loc[curr_idx, 'position'] * curr_price
                 backtest_df.loc[curr_idx, 'total_value'] = backtest_df.loc[curr_idx, 'capital'] + backtest_df.loc[curr_idx, 'holdings']
             
+            # Force exit any remaining position at the end of backtest
+            if currently_in_trade:
+                last_idx = backtest_df.index[-1]
+                last_price = backtest_df.loc[last_idx, 'close']
+                exit_price = apply_slippage(last_price, False)
+                
+                # Calculate final position value
+                final_position = backtest_df.loc[last_idx, 'position']
+                position_value = final_position * exit_price
+                
+                # Update final capital and holdings
+                backtest_df.loc[last_idx, 'capital'] += position_value
+                backtest_df.loc[last_idx, 'position'] = 0
+                backtest_df.loc[last_idx, 'holdings'] = 0
+                backtest_df.loc[last_idx, 'total_value'] = backtest_df.loc[last_idx, 'capital']
+                
+                # Record final trade
+                trade_return = (exit_price / trade_entry_price) - 1
+                trades.append({
+                    'entry_date': backtest_df.index[trade_entry_idx],
+                    'exit_date': last_idx,
+                    'entry_price': trade_entry_price,
+                    'exit_price': exit_price,
+                    'return': trade_return,
+                    'exit_type': 'end_of_period',
+                    'duration': trade_duration
+                })
+            
             # Calculate performance metrics
             if not trades:
-                # Log details about why no trades were generated
                 logger.warning(f"No trades executed. Trial params: {trial.params}")
                 logger.warning(f"Predictions summary: Mean={backtest_df['prediction'].mean()}, Sum={backtest_df['prediction'].sum()}")
-                logger.warning(f"Probability summary: Min={backtest_df['prediction_proba'].min()}, "
-                             f"Max={backtest_df['prediction_proba'].max()}, Mean={backtest_df['prediction_proba'].mean()}")
                 
-                # Heavy penalty for no trades
-                return -2000
+                # Reasonable penalty for no trades
+                return -75
             
             # Calculate returns and metrics
+            trades_df = pd.DataFrame(trades)
+            
+            # Calculate win rate and other metrics
+            winning_trades = (trades_df['return'] > 0).sum()
+            win_rate = winning_trades / len(trades_df)
+            
+            # Calculate profit factor
+            profits = trades_df.loc[trades_df['return'] > 0, 'return'].sum()
+            losses = abs(trades_df.loc[trades_df['return'] < 0, 'return'].sum()) if len(trades_df.loc[trades_df['return'] < 0]) > 0 else 0.001
+            profit_factor = profits / losses if losses > 0 else profits
+            
+            # Calculate average win/loss ratio
+            avg_win = trades_df.loc[trades_df['return'] > 0, 'return'].mean() if winning_trades > 0 else 0
+            avg_loss = abs(trades_df.loc[trades_df['return'] < 0, 'return'].mean()) if len(trades_df) - winning_trades > 0 else 0.001
+            win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else avg_win
+            
+            # Calculate performance metrics
             backtest_df['daily_return'] = backtest_df['total_value'].pct_change()
             backtest_df['cumulative_return'] = (backtest_df['total_value'] / initial_capital) - 1
             
@@ -569,48 +685,33 @@ class AIBacktestOptimizer:
             total_return = (final_value / initial_capital - 1)
             max_drawdown = backtest_df['drawdown'].min()
             
-            # Calculate win rate
-            trades_df = pd.DataFrame(trades)
-            if len(trades_df) > 0:
-                winning_trades = (trades_df['return'] > 0).sum()
-                win_rate = winning_trades / len(trades_df)
-                
-                # Calculate profit factor (sum of profits / sum of losses)
-                profits = trades_df.loc[trades_df['return'] > 0, 'return'].sum()
-                losses = abs(trades_df.loc[trades_df['return'] < 0, 'return'].sum()) if len(trades_df.loc[trades_df['return'] < 0]) > 0 else 0.001
-                
-                profit_factor = profits / losses if losses > 0 else profits
-                
-                # Calculate average win/loss ratio
-                avg_win = trades_df.loc[trades_df['return'] > 0, 'return'].mean() if winning_trades > 0 else 0
-                avg_loss = abs(trades_df.loc[trades_df['return'] < 0, 'return'].mean()) if len(trades_df) - winning_trades > 0 else 0.001
-                win_loss_ratio = avg_win / avg_loss if avg_loss > 0 else avg_win
-                
-                # Calculate Sharpe ratio (annualized)
-                annual_factor = 252  # trading days per year
-                if backtest_df['daily_return'].std() > 0:
-                    sharpe_ratio = backtest_df['daily_return'].mean() / backtest_df['daily_return'].std() * (annual_factor ** 0.5)
-                else:
-                    sharpe_ratio = 0
+            # Calculate Sharpe ratio (annualized)
+            annual_factor = 252 * 1440  # Minutes per year (assuming 1-minute data)
+            if backtest_df['daily_return'].std() > 0:
+                sharpe_ratio = backtest_df['daily_return'].mean() / backtest_df['daily_return'].std() * (annual_factor ** 0.5)
             else:
-                win_rate = 0
-                profit_factor = 0
-                win_loss_ratio = 0
                 sharpe_ratio = 0
             
-            # Combine metrics into a single optimization score
-            # Adjusted weights to focus on profitability and number of trades
-            if profit_factor == 0:
-                optimization_score = -500  # Penalize but don't completely reject
+            # New: Calculate expectancy (average R-multiple)
+            if len(trades_df) > 0:
+                avg_return = trades_df['return'].mean()
+                expectancy = avg_return / abs(stop_loss_pct) if stop_loss_pct > 0 else 0
+            else:
+                expectancy = 0
+            
+            # Combine metrics into a single optimization score with balanced emphasis
+            if profit_factor <= 0:
+                optimization_score = -50
             else:
                 optimization_score = (
-                    3.0 * profit_factor +          # Increased weight for profit factor
-                    1.5 * win_rate +               # Increased weight for win rate
-                    0.5 * win_loss_ratio +         # Include win/loss ratio
-                    2.0 * total_return -           # Increased weight for total return
-                    1.0 * abs(max_drawdown) +      # Reduced penalty for drawdowns
-                    0.5 * sharpe_ratio +           # Include risk-adjusted return
-                    0.5 * min(len(trades_df) / 10, 3.0)  # Increased incentive for more trades
+                    4.0 * profit_factor +               # Highest weight for profit factor
+                    2.0 * win_rate +                    # Important for consistency
+                    1.0 * win_loss_ratio +              # Include win/loss ratio
+                    3.0 * total_return -                # Important for overall performance
+                    2.0 * abs(max_drawdown) +           # Control risk
+                    1.0 * sharpe_ratio +                # Risk-adjusted return
+                    1.0 * expectancy +                  # Average R-multiple
+                    0.5 * min(len(trades_df) / 20, 2.0) # Moderate incentive for more trades
                 )
             
             # Store metrics for logging
@@ -620,10 +721,11 @@ class AIBacktestOptimizer:
             trial.set_user_attr('max_drawdown', max_drawdown)
             trial.set_user_attr('sharpe_ratio', sharpe_ratio)
             trial.set_user_attr('num_trades', len(trades_df))
+            trial.set_user_attr('expectancy', expectancy)
             
             logger.info(f"Trial {trial.number}: Score={optimization_score:.4f}, "
-                      f"Return={total_return:.4f}, Win Rate={win_rate:.4f}, "
-                      f"PF={profit_factor:.4f}, Trades={len(trades_df)}")
+                    f"Return={total_return:.4f}, Win Rate={win_rate:.4f}, "
+                    f"PF={profit_factor:.4f}, Trades={len(trades_df)}")
             
             return optimization_score
             
@@ -631,7 +733,7 @@ class AIBacktestOptimizer:
             logger.error(f"Error in objective function: {e}")
             import traceback
             traceback.print_exc()
-            return -800  # Return a low but not worst possible score on error
+            return -30  # Return a moderate penalty on error
     
     def optimize(self, storage=None):
         """
@@ -1151,6 +1253,7 @@ class AIBacktestOptimizer:
 # Add a main function to run the AI Backtest Optimizer
 def main():
     import argparse
+    import os
     
     parser = argparse.ArgumentParser(description='AI Backtest Optimizer')
     parser.add_argument('--symbol', type=str, default='BTC-USD', help='Trading symbol')
@@ -1162,43 +1265,87 @@ def main():
     parser.add_argument('--plot', action='store_true', help='Plot backtest results')
     parser.add_argument('--save', action='store_true', help='Save model and results')
     parser.add_argument('--db', action='store_true', help='Save results to database')
+    parser.add_argument('--output_dir', type=str, default='backtest_results', help='Directory to save results')
     
     args = parser.parse_args()
+    coinbase_robin_crypto = ['BTC-USD', 'ETH-USD', 'DOGE-USD', 'SHIB-USD', 'AVAX-USD', 'BCH-USD', 'LINK-USD', 'UNI-USD', 'LTC-USD', 'XLM-USD', 'ETC-USD', 'AAVE-USD', 'XTZ-USD', 'COMP-USD']
+    granularities = ['ONE_MINUTE', 'FIVE_MINUTE', 'FIFTEEN_MINUTE', 'THIRTY_MINUTE', 'ONE_HOUR', 'TWO_HOUR', 'SIX_HOUR', 'ONE_DAY']
+    
+    # Create output directory if it doesn't exist
+    if args.save:
+        os.makedirs(args.output_dir, exist_ok=True)
+    
+    results_summary = []
     
     try:
-        # Initialize the optimizer
-        optimizer = AIBacktestOptimizer(
-            symbol=args.symbol,
-            granularity=args.granularity,
-            num_days=args.days,
-            n_trials=args.trials,
-            study_name=args.study
-        )
+        for symbol in coinbase_robin_crypto:  # Fixed: Use the crypto list for symbols
+            for gran in granularities:
+                logger.info(f"Starting backtest optimization for {symbol} with {gran} granularity")
+                
+                # Create symbol-specific study name to avoid conflicts
+                study_name = f"{symbol}_{gran}_study" if args.study is None else f"{args.study}_{symbol}_{gran}"
+                
+                optimizer = AIBacktestOptimizer(
+                    symbol=symbol,
+                    granularity=gran,
+                    num_days=360,
+                    n_trials=70,
+                    study_name=study_name
+                )
+                
+                try:
+                    # Prepare features
+                    optimizer.prepare_features()
+                    
+                    # Run optimization
+                    best_params = optimizer.optimize(storage=args.storage)
+                    
+                    # Run backtest with best parameters
+                    results, backtest_df = optimizer.run_backtest_with_best_params()
+                    
+                    # Add to summary
+                    results['symbol'] = symbol
+                    results['granularity'] = gran
+                    results_summary.append(results)
+                    
+                    # Plot results if requested
+                    if args.plot:
+                        plot_path = f"{args.output_dir}/backtest_{symbol}_{gran}.png" if args.save else None
+                        optimizer.plot_backtest_results(backtest_df, save_path=plot_path)
+                    
+                    # Save model if requested
+                    if args.save:
+                        model_path = f"{args.output_dir}/model_{symbol}_{gran}.pkl"
+                        optimizer.save_model(path=model_path)
+                        
+                        # Save backtest dataframe
+                        df_path = f"{args.output_dir}/backtest_df_{symbol}_{gran}.csv"
+                        backtest_df.to_csv(df_path)
+                        
+                        # Save results
+                        import json
+                        results_path = f"{args.output_dir}/results_{symbol}_{gran}.json"
+                        with open(results_path, 'w') as f:
+                            json.dump(results, f)
+                    
+                    # Save to database if requested
+                    if args.db:
+                        optimizer.save_backtest_to_db(results, backtest_df)
+                    
+                    logger.info(f"Successfully completed {symbol} with {gran} granularity")
+                    
+                except Exception as e:
+                    logger.error(f"Error processing {symbol} with {gran}: {e}")
+                    continue  # Continue with next pair if one fails
         
-        # Prepare features (do this separately to catch errors early)
-        optimizer.prepare_features()
+        # Save overall summary if requested
+        if args.save and results_summary:
+            import pandas as pd
+            summary_df = pd.DataFrame(results_summary)
+            summary_df.to_csv(f"{args.output_dir}/backtest_summary.csv", index=False)
         
-        # Run optimization
-        best_params = optimizer.optimize(storage=args.storage)
-        
-        # Run backtest with best parameters
-        results, backtest_df = optimizer.run_backtest_with_best_params()
-        
-        # Plot results if requested
-        if args.plot:
-            plot_path = f"core/ai/img/backtest_{args.symbol}_{args.granularity}.png" if args.save else None
-            optimizer.plot_backtest_results(backtest_df, save_path=plot_path)
-        
-        # Save model if requested
-        if args.save:
-            optimizer.save_model()
-        
-        # Save to database if requested
-        if args.db:
-            optimizer.save_backtest_to_db(results, backtest_df)
-        
-        logger.info("AI Backtest Optimization completed successfully")
-        
+        logger.info("All backtest optimizations completed")
+                
     except Exception as e:
         logger.error(f"Error in main execution: {e}")
         import traceback

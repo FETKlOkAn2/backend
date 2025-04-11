@@ -57,9 +57,6 @@ def create_app(config_class=Config):
 # Create Flask app
 app = create_app()
 
-print("Loaded SECRET_KEY:", app.config["SECRET_KEY"])
-
-
 # Configure Socket.IO with proper CORS settings
 socketio = SocketIO(
     app, 

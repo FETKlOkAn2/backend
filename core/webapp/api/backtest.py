@@ -1,16 +1,23 @@
-# mypy: disable-error-code=import-untyped
-# pylint: disable=C0114
-
-from flask import Blueprint, request, jsonify, current_app
-import datetime
+import json
+import os
+import sys
+import logging
+from datetime import datetime
 import jwt
 import pandas as pd
 import base64
 import plotly.io as pio
+
+# Add your project's core directory to sys.path
+sys.path.append('/opt/python')
+
+# Import your existing modules
 import core.database_interaction as database_interaction
 from core.webapp.services.backtest_service import get_strategy_class, run_backtest
 
-backtest_bp = Blueprint('backtest', __name__)
+# Set up logging
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
 
 def to_png(fig):
     """Convert a Plotly figure to a base64-encoded PNG."""
@@ -18,7 +25,7 @@ def to_png(fig):
         img_bytes = pio.to_image(fig, format="png")
         return base64.b64encode(img_bytes).decode('utf-8')
     except Exception as e:
-        current_app.logger.error(f"Error converting graph to PNG: {str(e)}")
+        logger.error(f"Error converting graph to PNG: {str(e)}")
         raise ValueError("Graph conversion failed.")
 
 def convert_results_to_json(results):
@@ -42,47 +49,84 @@ def convert_results_to_json(results):
             
     return converted_results
 
-@backtest_bp.route('/backtest', methods=['POST'])
-def backtest():
-    """Run a backtest with the provided parameters."""
-    params = request.json
-    current_app.logger.info(f"Received backtest params: {params}")
+def lambda_handler(event, context):
+    """AWS Lambda handler for backtest endpoint"""
+    
+    # Extract HTTP method and path from the event
+    http_method = event.get('httpMethod', '')
+    path = event.get('path', '')
+    
+    # Process based on HTTP method
+    if http_method == 'POST' and path.endswith('/backtest'):
+        return handle_backtest(event)
+    elif http_method == 'GET' and path.endswith('/backtests'):
+        return handle_get_history(event)
+    else:
+        return {
+            'statusCode': 400,
+            'body': json.dumps({'status': 'error', 'message': 'Invalid endpoint or method'})
+        }
 
-    # Validate the strategy
-    strategy_name = params.get("strategy_obj")
-    if not strategy_name:
-        return jsonify({"status": "error", "message": "Strategy not provided"}), 400
-        
-    strategy_obj = get_strategy_class(strategy_name)
-    if not strategy_obj:
-        return jsonify({"status": "error", "message": f"Invalid strategy: {strategy_name}"}), 400
-
-    # Extract authentication token
-    token = request.headers.get('Authorization')
-    if not token:
-        return jsonify({"status": "error", "message": "Authentication required"}), 401
-
-    if token.startswith('Bearer '):
-        token = token[7:]
-        
+def handle_backtest(event):
+    """Handle POST /backtest request"""
     try:
+        # Parse request body
+        body = json.loads(event.get('body', '{}'))
+        logger.info(f"Received backtest params: {body}")
+        
+        # Validate the strategy
+        strategy_name = body.get("strategy_obj")
+        if not strategy_name:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({"status": "error", "message": "Strategy not provided"})
+            }
+            
+        strategy_obj = get_strategy_class(strategy_name)
+        if not strategy_obj:
+            return {
+                'statusCode': 400,
+                'body': json.dumps({"status": "error", "message": f"Invalid strategy: {strategy_name}"})
+            }
+    
+        # Extract authentication token
+        headers = event.get('headers', {})
+        token = headers.get('Authorization')
+        
+        if not token:
+            return {
+                'statusCode': 401,
+                'body': json.dumps({"status": "error", "message": "Authentication required"})
+            }
+    
+        if token.startswith('Bearer '):
+            token = token[7:]
+            
         # Decode token to get user email
-        decoded = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=["HS256"])
+        secret_key = os.environ.get('SECRET_KEY')
+        decoded = jwt.decode(token, secret_key, algorithms=["HS256"])
         email = decoded['email']
+        
+        # Get config values from environment variables
+        backtest_default_days = int(os.environ.get('BACKTEST_DEFAULT_DAYS', '30'))
+        trading_default_sizing = int(os.environ.get('TRADING_DEFAULT_SIZING', '1000'))
         
         # Run the backtest
         stats, graph_base64 = run_backtest(
-            symbol=params.get("symbol"),
-            granularity=params.get("granularity"),
+            symbol=body.get("symbol"),
+            granularity=body.get("granularity"),
             strategy_obj=strategy_obj,
-            num_days=params.get("num_days", current_app.config.get('BACKTEST_DEFAULT_DAYS', 30)),
-            sizing=params.get("sizing", current_app.config.get('TRADING_DEFAULT_SIZING', 1000)),
-            best_params=params.get("best_params", {}),
+            num_days=body.get("num_days", backtest_default_days),
+            sizing=body.get("sizing", trading_default_sizing),
+            best_params=body.get("best_params", {}),
             graph_callback=to_png
         )
         
         if stats is None:
-            return jsonify({"status": "error", "message": "Backtest returned no stats"}), 500
+            return {
+                'statusCode': 500,
+                'body': json.dumps({"status": "error", "message": "Backtest returned no stats"})
+            }
             
         # Convert results to JSON-serializable format
         json_friendly_stats = convert_results_to_json(stats)
@@ -90,52 +134,83 @@ def backtest():
         # Save backtest to database
         database_interaction.save_backtest(
             email=email,
-            symbol=params["symbol"],
-            strategy=params["strategy_obj"],
+            symbol=body["symbol"],
+            strategy=body["strategy_obj"],
             result=stats,
-            date=datetime.datetime.now().isoformat()
+            date=datetime.now().isoformat()
         )
         
-        return jsonify({
-            "status": "success", 
-            "stats": json_friendly_stats, 
-            "graph": graph_base64
-        })
+        return {
+            'statusCode': 200,
+            'body': json.dumps({
+                "status": "success", 
+                "stats": json_friendly_stats, 
+                "graph": graph_base64
+            })
+        }
         
     except jwt.ExpiredSignatureError:
-        return jsonify({"status": "error", "message": "Token has expired"}), 401
+        return {
+            'statusCode': 401,
+            'body': json.dumps({"status": "error", "message": "Token has expired"})
+        }
     except jwt.InvalidTokenError:
-        return jsonify({"status": "error", "message": "Invalid token"}), 401
+        return {
+            'statusCode': 401,
+            'body': json.dumps({"status": "error", "message": "Invalid token"})
+        }
     except Exception as e:
-        current_app.logger.error(f"Backtest failed: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        logger.error(f"Backtest failed: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({"status": "error", "message": str(e)})
+        }
 
-@backtest_bp.route('/backtests', methods=['GET'])
-def get_backtest_history():
-    """Get backtest history for the authenticated user."""
-    token = request.headers.get('Authorization')
-    current_app.logger.info(f"Get backtest history - Authorization header: {token}")
-    
-    if not token or not token.startswith("Bearer "):
-        current_app.logger.error("Token is missing or invalid")
-        return jsonify({"status": "error", "message": "Authentication required"}), 401
-    
-    token = token.split("Bearer ")[1]
-    
+def handle_get_history(event):
+    """Handle GET /backtests request"""
     try:
-        decoded = jwt.decode(token, current_app.config['SECRET_KEY'], algorithms=["HS256"])
-        current_app.logger.info(f"Decoded token: {decoded}")
+        # Extract token from headers
+        headers = event.get('headers', {})
+        token = headers.get('Authorization')
+        logger.info(f"Get backtest history - Authorization header: {token}")
+        
+        if not token or not token.startswith("Bearer "):
+            logger.error("Token is missing or invalid")
+            return {
+                'statusCode': 401,
+                'body': json.dumps({"status": "error", "message": "Authentication required"})
+            }
+        
+        token = token.split("Bearer ")[1]
+        
+        # Decode token
+        secret_key = os.environ.get('SECRET_KEY')
+        decoded = jwt.decode(token, secret_key, algorithms=["HS256"])
+        logger.info(f"Decoded token: {decoded}")
         email = decoded['email']
         
+        # Get backtest history
         history = database_interaction.get_backtest_history(email)
-        return jsonify({"status": "success", "history": history}), 200
-        
+        return {
+            'statusCode': 200,
+            'body': json.dumps({"status": "success", "history": history})
+        }
+            
     except jwt.ExpiredSignatureError:
-        current_app.logger.error("Token has expired")
-        return jsonify({"status": "error", "message": "Token has expired"}), 401
+        logger.error("Token has expired")
+        return {
+            'statusCode': 401,
+            'body': json.dumps({"status": "error", "message": "Token has expired"})
+        }
     except jwt.InvalidTokenError as e:
-        current_app.logger.error(f"Invalid token: {e}")
-        return jsonify({"status": "error", "message": "Invalid token"}), 401
+        logger.error(f"Invalid token: {e}")
+        return {
+            'statusCode': 401,
+            'body': json.dumps({"status": "error", "message": "Invalid token"})
+        }
     except Exception as e:
-        current_app.logger.error(f"Failed to get backtest history: {str(e)}")
-        return jsonify({"status": "error", "message": str(e)}), 500
+        logger.error(f"Failed to get backtest history: {str(e)}")
+        return {
+            'statusCode': 500,
+            'body': json.dumps({"status": "error", "message": str(e)})
+        }
