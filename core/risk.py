@@ -29,6 +29,7 @@ class Risk_Handler:
         self.balance_high_watermark = self.initial_balance
         self.current_drawdown = 0
         self.active_trades = {}
+        self.percent_to_size = 0.02
         
         # Symbol-specific parameters
         self.symbol_params = {}

@@ -312,6 +312,67 @@ def _create_table_if_not_exists(table_name, df, conn):
     except Exception as e:
         print(f"Error occurred while creating table {table_name}: {e}")
 
+def get_best_params_without_df(strategy_name, symbol, granularity, minimum_trades=None):
+    """
+    Get best strategy parameters from database without needing a strategy instance with df
+    
+    Args:
+        strategy_name: Name of the strategy class
+        symbol: Trading symbol
+        granularity: Time granularity
+        minimum_trades: Minimum number of trades required
+        
+    Returns:
+        list: Best strategy parameters
+    """
+    import sqlite3 as sql
+    import pandas as pd
+    import os
+    
+    db_path = os.getenv('DATABASE_PATH')
+    
+    try:
+        conn = sql.connect(f'{db_path}/hyper.db')
+    except Exception as e:
+        logger.error(f'Failed to connect to the database: {e}')
+        return None
+
+    try:
+        # Use strategy_name directly instead of strategy_object.__class__.__name__
+        table = f"{strategy_name}_{granularity}"
+        
+        # Determine parameter names for RSI_ADX_GPU (or other strategies if needed)
+        if strategy_name == 'RSI_ADX_GPU' or strategy_name == 'RSI_ADX_NP':
+            parameters = 'rsi_window, buy_threshold, sell_threshold, adx_time_period, adx_buy_threshold'
+        else:
+            # If you have other strategies, add their parameter lists here
+            logger.warning(f"Parameter list not defined for strategy {strategy_name}")
+            return None
+
+        query = f'SELECT {parameters}, MAX("Total Return [%]") AS max_return FROM {table} WHERE symbol="{symbol}"'
+        if minimum_trades is not None:
+            query += f' AND "Total Trades" >= {minimum_trades}'
+        
+        logger.debug(f"Executing query: {query}")
+
+        result = pd.read_sql_query(query, conn)
+        
+        if result.empty or all(result.iloc[0].isnull()):
+            logger.info(f"No valid results for strategy {strategy_name} with granularity {granularity}")
+            return None
+
+        # Extract parameter values (excluding the max_return column)
+        param_columns = result.columns[:-1]  # All columns except the last one (max_return)
+        list_results = [result[param].iloc[0] for param in param_columns]
+        
+        logger.info(f"Found best parameters for {strategy_name} ({granularity}): {list_results}")
+        return list_results
+
+    except Exception as e:
+        logger.error(f'Error querying database for {strategy_name} parameters: {e}')
+        return None
+    finally:
+        conn.close()
 def get_users():
     conn = sql.connect(f'{db_path}/users.db')
     query = "SELECT email, password FROM users;"
@@ -707,7 +768,40 @@ def export_optimization_results_to_db(study, strategy_class):
 
         conn.commit()
         conn.close()    
+        
+def export_optimization_summary_to_db(results_df, strategy_name):
+    """Export optimization summary results to the database."""
+    conn = sql.connect(f'{db_path}/hyper_optuna.db')
+    table_name = f"OptimizationSummary_{strategy_name}"
 
+    # Create table if it doesn't exist
+    conn.execute(f"""
+        CREATE TABLE IF NOT EXISTS "{table_name}" (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            granularity TEXT,
+            best_value REAL,
+            best_params TEXT,
+            n_trials INTEGER,
+            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+
+    # Insert the results
+    for _, row in results_df.iterrows():
+        conn.execute(f"""
+            INSERT INTO "{table_name}" (symbol, granularity, best_value, best_params, n_trials)
+            VALUES (?, ?, ?, ?, ?)
+        """, (
+            row['symbol'],
+            row['granularity'],
+            row['best_value'],
+            str(row['best_params']),
+            row['n_trials']
+        ))
+
+    conn.commit()
+    conn.close()
 # def export_optimization_results(df):
 #     try:
 #         conn = sql.connect(f'{db_path}/ai_optimization.db')

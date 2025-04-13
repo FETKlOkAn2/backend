@@ -1,0 +1,44 @@
+service: coinbase-trader
+
+provider:
+  name: aws
+  runtime: python3.9
+  region: us-east-1
+  timeout: 30
+  memorySize: 512
+  environment:
+    SECRET_KEY: ${ssm:/coinbase-trader/secret-key}
+    DB_PATH: ${env:DB_PATH, '/tmp/db'} # Default to /tmp/db if not set
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - ssm:GetParameter
+      Resource: "arn:aws:ssm:${self:provider.region}:*:parameter/coinbase-trader/*"
+
+functions:
+  getBacktestHistory:
+    handler: lambda_functions/backtest_history_lambda.lambda_handler
+    events:
+      - http:
+          path: api/backtests
+          method: get
+          cors: true
+
+package:
+  exclude:
+    - node_modules/**
+    - .git/**
+    - .env
+    - __pycache__/**
+    - '**/*.pyc'
+  include:
+    - lambda_functions/**
+    - core/**
+    - database/**
+
+plugins:
+  - serverless-python-requirements
+
+custom:
+  pythonRequirements:
+    dockerizePip: true  

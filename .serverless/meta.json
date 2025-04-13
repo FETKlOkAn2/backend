@@ -1,0 +1,100 @@
+{
+  "C:\\Users\\tomas\\OneDrive\\Computer\\Dazehad_crypto\\Coinbase_Trader\\serverless.yml": {
+    "versionFramework": "4.12.0",
+    "servicePath": "C:\\Users\\tomas\\OneDrive\\Computer\\Dazehad_crypto\\Coinbase_Trader\\serverless.yml",
+    "serviceConfigFileName": "serverless.yml",
+    "service": {
+      "service": "coinbase-trader",
+      "provider": {
+        "name": "aws",
+        "runtime": "python3.9",
+        "region": "us-east-1",
+        "timeout": 30,
+        "memorySize": 512,
+        "environment": {
+          "SECRET_KEY": "<REDACTED>",
+          "DB_PATH": "${env:DB_PATH, '/tmp/db'}"
+        },
+        "iamRoleStatements": [
+          {
+            "Effect": "Allow",
+            "Action": [
+              "ssm:GetParameter"
+            ],
+            "Resource": "arn:aws:ssm:${self:provider.region}:*:parameter/coinbase-trader/*"
+          }
+        ]
+      },
+      "functions": {
+        "getBacktestHistory": {
+          "handler": "lambda_functions/backtest_history_lambda.lambda_handler",
+          "events": [
+            {
+              "http": {
+                "path": "api/backtests",
+                "method": "get",
+                "cors": true
+              }
+            }
+          ]
+        }
+      },
+      "package": {
+        "exclude": [
+          "node_modules/**",
+          ".git/**",
+          ".env",
+          "__pycache__/**",
+          "**/*.pyc"
+        ],
+        "include": [
+          "lambda_functions/**",
+          "core/**",
+          "database/**"
+        ]
+      },
+      "plugins": [
+        "serverless-python-requirements"
+      ],
+      "custom": {
+        "pythonRequirements": {
+          "dockerizePip": true
+        }
+      }
+    },
+    "provider": {
+      "name": "aws",
+      "runtime": "python3.9",
+      "region": "us-east-1",
+      "timeout": 30,
+      "memorySize": 512,
+      "environment": {
+        "SECRET_KEY": "<REDACTED>",
+        "DB_PATH": "${env:DB_PATH, '/tmp/db'}"
+      },
+      "iamRoleStatements": [
+        {
+          "Effect": "Allow",
+          "Action": [
+            "ssm:GetParameter"
+          ],
+          "Resource": "arn:aws:ssm:${self:provider.region}:*:parameter/coinbase-trader/*"
+        }
+      ]
+    },
+    "error": {
+      "message": "You must sign in or use a license key with Serverless Framework V.4 and later versions. Please use \"serverless login\".",
+      "stack": "Error: You must sign in or use a license key with Serverless Framework V.4 and later versions. Please use \"serverless login\".\n    at Authentication.getAuthenticatedData (file:///C:/Users/tomas/.serverless/releases/4.12.0/package/dist/sf-core.js:557:10892)\n    at process.processTicksAndRejections (node:internal/process/task_queues:95:5)\n    at async routeExistingService (file:///C:/Users/tomas/.serverless/releases/4.12.0/package/dist/sf-core.js:565:4701)\n    at async commandOnboarding (file:///C:/Users/tomas/.serverless/releases/4.12.0/package/dist/sf-core.js:563:20059)\n    at async _CoreRunner.run (file:///C:/Users/tomas/.serverless/releases/4.12.0/package/dist/sf-core.js:794:6300)\n    at async route (file:///C:/Users/tomas/.serverless/releases/4.12.0/package/dist/sf-core.js:1084:2779)\n    at async Object.run (file:///C:/Users/tomas/.serverless/releases/4.12.0/package/dist/sf-core.js:1085:3661)\n    at async run2 (file:///C:/Users/tomas/.serverless/releases/4.12.0/package/dist/sf-core.js:1085:4814)"
+    },
+    "serviceRawFile": "service: coinbase-trader\r\n\r\nprovider:\r\n  name: aws\r\n  runtime: python3.9\r\n  region: us-east-1\r\n  timeout: 30\r\n  memorySize: 512\r\n  environment:\r\n    SECRET_KEY: ${ssm:/coinbase-trader/secret-key}\r\n    DB_PATH: ${env:DB_PATH, '/tmp/db'} # Default to /tmp/db if not set\r\n  iamRoleStatements:\r\n    - Effect: Allow\r\n      Action:\r\n        - ssm:GetParameter\r\n      Resource: \"arn:aws:ssm:${self:provider.region}:*:parameter/coinbase-trader/*\"\r\n\r\nfunctions:\r\n  getBacktestHistory:\r\n    handler: lambda_functions/backtest_history_lambda.lambda_handler\r\n    events:\r\n      - http:\r\n          path: api/backtests\r\n          method: get\r\n          cors: true\r\n\r\npackage:\r\n  exclude:\r\n    - node_modules/**\r\n    - .git/**\r\n    - .env\r\n    - __pycache__/**\r\n    - '**/*.pyc'\r\n  include:\r\n    - lambda_functions/**\r\n    - core/**\r\n    - database/**\r\n\r\nplugins:\r\n  - serverless-python-requirements\r\n\r\ncustom:\r\n  pythonRequirements:\r\n    dockerizePip: true  ",
+    "command": [],
+    "options": {
+      "org": "your-org-name"
+    },
+    "serviceProviderAwsCfStackId": null,
+    "serviceProviderAwsCfStackCreated": null,
+    "serviceProviderAwsCfStackUpdated": null,
+    "serviceProviderAwsCfStackStatus": null,
+    "serviceProviderAwsCfStackOutputs": null
+  }
+}
