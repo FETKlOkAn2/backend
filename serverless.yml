@@ -2,7 +2,7 @@ service: coinbase-trader
 
 provider:
   name: aws
-  runtime: python3.9
+  runtime: python3.10
   region: us-east-1
   timeout: 900
   memorySize: 2048
@@ -56,11 +56,25 @@ package:
     - '**/*.pyc'
   include:
     - lambda_functions/**
+    - install_talib.sh
 
 plugins:
   - serverless-python-requirements
 
 custom:
   pythonRequirements:
-    dockerizePip: true
+    dockerizePip: false
+    # Use apt-get to install required build dependencies
+    dockerRunCmds:
+      - apt-get update
+      - apt-get install -y wget build-essential
+      - chmod +x /var/task/install_talib.sh
+      - /var/task/install_talib.sh
+      - pip install --no-cache-dir -r /var/task/requirements.txt
+    pipCmdExtraArgs:
+      - --no-cache-dir
     slim: true
+    # Use your own docker image if the default one doesn't work
+    dockerImage: public.ecr.aws/sam/build-python3.10:latest-x86_64
+    useDownloadCache: true
+    useStaticCache: true
