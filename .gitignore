@@ -12,3 +12,4 @@ cupy
 .env
 core/.env
 ai_backtest.log
+node_modules/
