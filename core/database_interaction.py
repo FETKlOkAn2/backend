@@ -388,7 +388,7 @@ def save_user(email, password, privacy_policy_accepted=False, api_key=None):
     conn.commit()
     conn.close()
 
-save_user("test_user", "test_password")
+#save_user("test_user", "test_password")
 def get_backtest_history(email):
     _create_table_if_not_exists('backtests', pd.DataFrame(columns=['email', 'symbol', 'strategy', 'result', 'date']), sql.connect(f'{db_path}/backtests.db'))
     conn = sql.connect(f'{db_path}/backtests.db')

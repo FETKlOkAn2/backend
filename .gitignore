@@ -11,3 +11,4 @@ core/venv
 cupy
 .env
 core/.env
+ai_backtest.log
