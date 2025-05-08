@@ -1,6 +1,5 @@
 import pandas as pd
 import core.utils as utils
-import sqlite3 as sql
 import inspect
 import numpy as np
 import sys
@@ -35,14 +34,96 @@ logger = logging.getLogger(__name__) # Set to DEBUG, INFO, WARNING, ERROR, CRITI
 from dotenv import load_dotenv
 load_dotenv(override=True)
 
-db_path = os.getenv('DATABASE_PATH')
-print("DATABASE_PATH : ", db_path)
+import os
+from sqlalchemy import create_engine, text
+import pandas as pd
+
+#db_path = os.getenv('DATABASE_PATH')
+
+class MSSQLDatabase:
+    def __init__(self, db_file_name):
+        self.user = os.getenv("DB_USER")
+        self.password = os.getenv("DB_PASSWORD")
+        self.host = os.getenv("DB_HOST")
+        self.port = os.getenv("DB_PORT", "1433")
+        self.db = db_file_name # Retaining the original logic of string interpolation
+        self.driver = "ODBC+Driver+18+for+SQL+Server"
+        self.engine = self.get_engine() # Initialize engine in the constructor
+        self.lock = Lock() # Thread lock for database access
+
+    def get_engine(self):
+        url = (
+            f"mssql+pyodbc://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}?driver={self.driver}"
+            "&TrustServerCertificate=yes"
+        )
+        return create_engine(url, pool_pre_ping=True, fast_executemany=True)
+
+    def execute_sql(self, sql_text, params=None):
+         with self.lock, self.engine.begin() as conn:
+             if params:
+                 return conn.execute(text(sql_text), params)
+             else:
+                 return conn.execute(text(sql_text))
+    def read_sql_query(self, sql_text, params=None):
+        """Execute a SQL query and return the result as a pandas DataFrame."""
+        with self.lock, self.engine.begin() as conn:
+            if params:
+                return pd.read_sql_query(text(sql_text), conn, params=params)
+            else:
+                return pd.read_sql_query(text(sql_text), conn)
+
+    def to_sql(self, df, table_name, if_exists='append', index=False):
+        """Write records stored in a DataFrame to a SQL database."""
+        with self.lock, self.engine.begin() as conn:
+            df.to_sql(table_name, conn, if_exists=if_exists, index=index, method='multi', chunksize=20000)
+            
+    def create_table_if_not_exists(self, table_name, df):
+        """
+        Creates a table if it doesn't exist based on the DataFrame's schema.
+        """
+        try:
+            # Check if the table exists
+            table_exists_query = f"IF OBJECT_ID('{table_name}', 'U') IS NOT NULL SELECT 1 ELSE SELECT 0;"
+            result = self.read_sql_query(table_exists_query)
+            table_exists = result.iloc[0, 0] == 1
+
+            if not table_exists:
+                # Build the CREATE TABLE query based on DataFrame's schema
+                columns = df.columns
+                dtypes = df.dtypes
+                sql_dtypes = []
+                for col in columns:
+                    dtype = dtypes[col]
+                    if pd.api.types.is_integer_dtype(dtype):
+                        sql_dtype = 'INT'
+                    elif pd.api.types.is_float_dtype(dtype):
+                        sql_dtype = 'FLOAT'
+                    elif dtype == 'datetime64[ns]':
+                        sql_dtype = 'DATETIME2'
+                    else:
+                        sql_dtype = 'NVARCHAR(MAX)'  # Use NVARCHAR(MAX) for TEXT
+
+                    sql_dtypes.append(f'[{col}] {sql_dtype}')
+
+                create_table_query = f"CREATE TABLE [{table_name}] ("
+                create_table_query += ', '.join(sql_dtypes)
+                create_table_query += ");"
+
+                self.execute_sql(create_table_query)
+                logger.info(f"Table {table_name} created successfully.")
+            else:
+                logger.info(f"Table {table_name} already exists.")
+        except Exception as e:
+            logger.error(f"Error occurred while creating table {table_name}: {e}")
+
 def get_historical_from_db(granularity, symbols: list = [], num_days: int = None, convert=False):
     original_symbol = symbols
 
     if convert:
         symbols = utils.convert_symbols(lone_symbol=symbols)
-    db_lock = Lock()
+
+    db_file = f'{granularity}'
+    db = MSSQLDatabase(db_file)
 
     # Ensure database path exists
     if not os.path.exists(db_path):
@@ -50,29 +131,23 @@ def get_historical_from_db(granularity, symbols: list = [], num_days: int = None
         return {}
         
     # Ensure the database file exists
-    db_file = f'{db_path}/{granularity}.db'
-    if not os.path.exists(db_file):
-        logger.error(f"Database file {db_file} does not exist!")
+    db_file_path = f'{db_path}/{granularity}'
+    if not os.path.exists(db_file_path):
+        logger.error(f"Database file {db_file_path} does not exist!")
         return {}
 
     try:
-        def get_connection():
-            with db_lock:
-                return sql.connect(db_file)
-                
-        conn = get_connection()
-        query = "SELECT name FROM sqlite_master WHERE type='table';"
-        tables = pd.read_sql_query(query, conn)
+        query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
+        tables = db.read_sql_query(query)
         tables_data = {}
         
-        logger.info(f"Found {len(tables)} tables in {granularity}.db")
+        logger.info(f"Found {len(tables)} tables in {granularity}")
         
         if tables.empty:
-            logger.warning(f"No tables found in {granularity}.db")
-            conn.close()
+            logger.warning(f"No tables found in {granularity}")
             return {}
         
-        for table in tables['name']:
+        for table in tables['TABLE_NAME']:
             clean_table_name = '-'.join(table.split('_')[:2])
             
             # If symbols are provided, skip tables that are not in the symbol list
@@ -81,7 +156,7 @@ def get_historical_from_db(granularity, symbols: list = [], num_days: int = None
 
             try:
                 # Retrieve data from the table
-                data = pd.read_sql_query(f'SELECT * FROM "{table}"', conn)
+                data = db.read_sql_query(f'SELECT * FROM "{table}"')
                 
                 if data.empty:
                     logger.warning(f"Table {table} is empty!")
@@ -108,11 +183,9 @@ def get_historical_from_db(granularity, symbols: list = [], num_days: int = None
                 logger.error(f"Error processing table {table}: {str(e)}")
                 continue
 
-        conn.close()
-        
         # Validate the result
         if not tables_data:
-            logger.warning(f"No data found for {symbols} in {granularity}.db")
+            logger.warning(f"No data found for {symbols} in {granularity}")
         else:
             for symbol, data in tables_data.items():
                 logger.info(f"Successfully retrieved {len(data)} rows for {symbol}")
@@ -127,15 +200,7 @@ def get_historical_from_db(granularity, symbols: list = [], num_days: int = None
 def get_best_params(strategy_object, df_manager=None, live_trading=False, best_of_all_granularities=False, minimum_trades=None, with_lowest_losing_average=False):
     granularities = ['ONE_MINUTE', 'FIVE_MINUTE', 'FIFTEEN_MINUTE', 'THIRTY_MINUTE', 'ONE_HOUR', 'TWO_HOUR', 'SIX_HOUR', 'ONE_DAY']
     
-    try:
-        conn = sql.connect(f'{db_path}/hyper.db') #or test_hyper.db
-        #print('Connected to the database successfully.')
-    except Exception as e:
-        #print('Failed to connect to the database:', e)
-        return None
-
-    #print('Getting best params...')
-    #print(f'DATABASE_PATH (best params): {db_path}/hyper.db')
+    db = MSSQLDatabase('hyper')
 
     try:
         if best_of_all_granularities:
@@ -145,7 +210,6 @@ def get_best_params(strategy_object, df_manager=None, live_trading=False, best_o
             
             for granularity in granularities:
                 try:
-                    #print(f'Processing granularity: {granularity}')
                     table = f"RSI_ADX_GPU_{granularity}" if strategy_object.__class__.__name__ == "RSI_ADX_NP" else f"{strategy_object.__class__.__name__}_{granularity}"
                     
                     params = inspect.signature(strategy_object.custom_indicator)
@@ -160,21 +224,16 @@ def get_best_params(strategy_object, df_manager=None, live_trading=False, best_o
                     query = f'SELECT {parameters}, MAX("Total Return [%]") AS max_return FROM {table} WHERE symbol="{symbol}"'
                     if minimum_trades is not None:
                         query += f' AND "Total Trades" >= {minimum_trades}'
-                    #print(f"Executing query: {query}")
 
-                    result = pd.read_sql_query(query, conn)
-                    #print(f"Query result for {granularity}:", result)
+                    result = db.read_sql_query(query)
 
                     if result.empty or all(result.iloc[0].isnull()):
-                        #print(f"No valid results for granularity: {granularity}")
                         continue
 
                     max_return = result['max_return'].iloc[0]
                     list_results = [
                         result[param].iloc[0] if param in result.columns else None for param in param_keys
                     ]
-
-                    #print(f"Results for {granularity}: max_return={max_return}, parameters={list_results}")
 
                     # Update the best results if this granularity has a higher return
                     if max_return > best_return:
@@ -233,10 +292,8 @@ def get_best_params(strategy_object, df_manager=None, live_trading=False, best_o
                 query = f'SELECT {parameters}, MAX("Total Return [%]") AS max_return FROM {table} WHERE symbol="{symbol}"'
                 if minimum_trades is not None:
                     query += f' AND "Total Trades" >= {minimum_trades}'
-                #print(f"Executing query: {query}")
 
-                result = pd.read_sql_query(query, conn)
-                #print(f"Query result:", result)
+                result = db.read_sql_query(query)
 
                 list_results = [
                     result[param].iloc[0] for param in param_keys if param in result.columns
@@ -247,95 +304,66 @@ def get_best_params(strategy_object, df_manager=None, live_trading=False, best_o
                 return None
 
     finally:
-        try:
-            conn.close()
-            #print('Database connection closed successfully.')
-        except Exception as e:
-            print('Failed to close the database connection:', e)
+       pass
 
     return best_results if best_of_all_granularities else list_results
 
 
 def export_optimization_results(df):
+    db = MSSQLDatabase('optimization')
     try:
-        conn = sql.connect(f'{db_path}/optimization.db')
         print("Connected to database successfully.")
-        _create_table_if_not_exists('optimization_results', df, conn)
+        db.create_table_if_not_exists('optimization_results', df)
         
-        # Check for unsupported types
         print("Verifying DataFrame types:")
         print(df.dtypes)
         
         print("Exporting results to the database...")
-        df.to_sql('optimization_results', conn, if_exists='append', index=False)
+        db.to_sql(df, 'optimization_results', if_exists='append', index=False)
         print("Data exported successfully.")
     except Exception as e:
         print(f"Error occurred while exporting optimization results: {e}")
     finally:
-        conn.close()
-        print("Database connection closed.")
-
-def _create_table_if_not_exists(table_name, df, conn):
-    """ Helper function to create table if it doesn't exist """
-    try:
-        # Check if the table exists
-        print(f"Checking if table {table_name} exists...")
-        table_exists_query = f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}';"
-        table_exists = pd.read_sql(table_exists_query, conn)
-        print("Table existence check completed.")
+        pass
+# def _create_table_if_not_exists(table_name, df, conn):
+#     """ Helper function to create table if it doesn't exist """
+#     try:
+#         # Check if the table exists
+#         print(f"Checking if table {table_name} exists...")
+#         table_exists_query = f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}';"
+#         table_exists = pd.read_sql(table_exists_query, conn)
+#         print("Table existence check completed.")
         
-        if table_exists.empty:
-            # Create table if it does not exist
-            print(f"Table {table_name} doesn't exist. Creating table...")
-            columns = df.columns
-            dtypes = df.dtypes  
-            sql_dtypes = []
-            for col in columns:
-                dtype = dtypes[col]
-                if pd.api.types.is_integer_dtype(dtype):
-                    sql_dtype = 'INTEGER'
-                elif pd.api.types.is_float_dtype(dtype):
-                    sql_dtype = 'REAL'
-                else:
-                    sql_dtype = 'TEXT'
-                sql_dtypes.append(f'"{col}" {sql_dtype}')
+#         if table_exists.empty:
+#             # Create table if it does not exist
+#             print(f"Table {table_name} doesn't exist. Creating table...")
+#             columns = df.columns
+#             dtypes = df.dtypes  
+#             sql_dtypes = []
+#             for col in columns:
+#                 dtype = dtypes[col]
+#                 if pd.api.types.is_integer_dtype(dtype):
+#                     sql_dtype = 'INTEGER'
+#                 elif pd.api.types.is_float_dtype(dtype):
+#                     sql_dtype = 'REAL'
+#                 else:
+#                     sql_dtype = 'TEXT'
+#                 sql_dtypes.append(f'"{col}" {sql_dtype}')
             
-            create_table_query = f"CREATE TABLE {table_name} ("
-            create_table_query += ', '.join(sql_dtypes)
-            create_table_query += ");"
-            print(f"Creating table with query:\n{create_table_query}")
+#             create_table_query = f"CREATE TABLE {table_name} ("
+#             create_table_query += ', '.join(sql_dtypes)
+#             create_table_query += ");"
+#             print(f"Creating table with query:\n{create_table_query}")
             
-            cursor = conn.cursor()
-            cursor.execute(create_table_query)
-            conn.commit()
-            print(f"Table {table_name} created successfully.")
-    except Exception as e:
-        print(f"Error occurred while creating table {table_name}: {e}")
+#             cursor = conn.cursor()
+#             cursor.execute(create_table_query)
+#             conn.commit()
+#             print(f"Table {table_name} created successfully.")
+#     except Exception as e:
+#         print(f"Error occurred while creating table {table_name}: {e}")
 
 def get_best_params_without_df(strategy_name, symbol, granularity, minimum_trades=None):
-    """
-    Get best strategy parameters from database without needing a strategy instance with df
-    
-    Args:
-        strategy_name: Name of the strategy class
-        symbol: Trading symbol
-        granularity: Time granularity
-        minimum_trades: Minimum number of trades required
-        
-    Returns:
-        list: Best strategy parameters
-    """
-    import sqlite3 as sql
-    import pandas as pd
-    import os
-    
-    db_path = os.getenv('DATABASE_PATH')
-    
-    try:
-        conn = sql.connect(f'{db_path}/hyper.db')
-    except Exception as e:
-        logger.error(f'Failed to connect to the database: {e}')
-        return None
+    db = MSSQLDatabase('hyper')
 
     try:
         # Use strategy_name directly instead of strategy_object.__class__.__name__
@@ -355,7 +383,7 @@ def get_best_params_without_df(strategy_name, symbol, granularity, minimum_trade
         
         logger.debug(f"Executing query: {query}")
 
-        result = pd.read_sql_query(query, conn)
+        result = db.read_sql_query(query)
         
         if result.empty or all(result.iloc[0].isnull()):
             logger.info(f"No valid results for strategy {strategy_name} with granularity {granularity}")
@@ -372,30 +400,32 @@ def get_best_params_without_df(strategy_name, symbol, granularity, minimum_trade
         logger.error(f'Error querying database for {strategy_name} parameters: {e}')
         return None
     finally:
-        conn.close()
+        pass
 def get_users():
-    conn = sql.connect(f'{db_path}/users.db')
+    db = MSSQLDatabase('users')
     query = "SELECT email, password FROM users;"
-    users = pd.read_sql_query(query, conn)
-    conn.close()
+    users = db.read_sql_query(query)
     users_dict = dict(zip(users['email'], users['password']))
     return users_dict
 def save_user(email, password, privacy_policy_accepted=False, api_key=None):
-    _create_table_if_not_exists('users', pd.DataFrame(columns=['email', 'password', 'privacy_policy_accepted', 'api_key']), sql.connect(f'{db_path}/users.db'))
-    conn = sql.connect(f'{db_path}/users.db')
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO users (email, password, privacy_policy_accepted, api_key) VALUES (?, ?, ?, ?);", (email, password, privacy_policy_accepted, api_key))
-    conn.commit()
-    conn.close()
+    db = MSSQLDatabase('users')
+    df = pd.DataFrame(columns=['email', 'password', 'privacy_policy_accepted', 'api_key'])
+    db.create_table_if_not_exists('users',df)
+    
+    data = {'email': email, 'password': password, 'privacy_policy_accepted': privacy_policy_accepted, 'api_key': api_key}
+    df = pd.DataFrame([data])
+    db.to_sql(df, 'users', if_exists='append', index=False)
+
 
 #save_user("test_user", "test_password")
 def get_backtest_history(email):
-    _create_table_if_not_exists('backtests', pd.DataFrame(columns=['email', 'symbol', 'strategy', 'result', 'date']), sql.connect(f'{db_path}/backtests.db'))
-    conn = sql.connect(f'{db_path}/backtests.db')
-    query = f"SELECT * FROM backtests WHERE email = ?;"
-    history = pd.read_sql_query(query, conn, params=(email,))
-    conn.close()
+    db = MSSQLDatabase('backtests')
+    df = pd.DataFrame(columns=['email', 'symbol', 'strategy', 'result', 'date'])
+    db.create_table_if_not_exists('backtests',df)
+    query = f"SELECT * FROM backtests WHERE email = ?"
+    history = db.read_sql_query(query, params={'email': email})
     return history.to_dict(orient="records")
+
 import json
 import datetime
 import pandas as pd
@@ -416,21 +446,14 @@ def save_backtest(email, symbol, strategy, result, date):
 
     # Serialize the processed result into JSON
     result_json = json.dumps(serializable_result)
+    
+    db = MSSQLDatabase('backtests')
+    df = pd.DataFrame(columns=['email', 'symbol', 'strategy', 'result', 'date'])
+    db.create_table_if_not_exists('backtests',df)
 
-    _create_table_if_not_exists(
-        'backtests',
-        pd.DataFrame(columns=['email', 'symbol', 'strategy', 'result', 'date']),
-        sql.connect(f'{db_path}/backtests.db')
-    )
-
-    conn = sql.connect(f'{db_path}/backtests.db')
-    cursor = conn.cursor()
-    cursor.execute("""
-        INSERT INTO backtests (email, symbol, strategy, result, date)
-        VALUES (?, ?, ?, ?, ?);
-    """, (email, symbol, strategy, result_json, date))
-    conn.commit()
-    conn.close()
+    data = {'email': email, 'symbol': symbol, 'strategy': strategy, 'result': result_json, 'date': date}
+    df = pd.DataFrame([data])
+    db.to_sql(df, 'backtests', if_exists='append', index=False)
 
 
 def export_hyper_to_db(strategy: object, hyper: object):
@@ -448,12 +471,7 @@ def export_hyper_to_db(strategy: object, hyper: object):
                           agg_func=None)
     
     # dont forget to change this when using hyper !!!
-    db_lock = Lock()
-    def get_connection():
-        with db_lock:
-            return sql.connect(f'{db_path}/hyper.db') #test_hyper
-
-    conn = get_connection()
+    db = MSSQLDatabase('hyper')
 
     symbol = strategy.symbol
     granularity = strategy.granularity
@@ -491,26 +509,23 @@ def export_hyper_to_db(strategy: object, hyper: object):
     table_name = f"{strategy.__class__.__name__}_{granularity}"
 
     # Create table if not exists
-    _create_table_if_not_exists(table_name, combined_df, conn=conn)
+    db.create_table_if_not_exists(table_name, combined_df)
 
     # Check for existing data and update
-    query = f'SELECT * FROM "{table_name}" WHERE symbol = ?;'
-    delete_query = f'DELETE FROM "{table_name}" WHERE symbol = ?;'
-    existing_data = pd.read_sql(query, conn, params=(symbol,))
+    query = f'SELECT * FROM "{table_name}" WHERE symbol = ?'
+    existing_data = db.read_sql_query(query, params={'symbol': symbol})
 
     if not existing_data.empty:
-        with conn:
-            conn.execute(delete_query, (symbol,))
-        combined_df.to_sql(table_name, conn, if_exists='append', index=False)
+        delete_query = f'DELETE FROM "{table_name}" WHERE symbol = ?'
+        db.execute_sql(delete_query, params={'symbol': symbol})
+        db.to_sql(combined_df, table_name, if_exists='append', index=False)
     else:
-        combined_df.to_sql(table_name, conn, if_exists='append', index=False)
+        db.to_sql(combined_df, table_name, if_exists='append', index=False)
 
-    conn.close()
     return
 
 def export_historical_to_db(dict_df, granularity):
-    conn = sql.connect(f'{db_path}/{granularity}.db')
-    cursor = conn.cursor()
+    db = MSSQLDatabase(f'{granularity}')
     
     for symbol, df in dict_df.items():
         # Replace hyphens with underscores in symbol
@@ -525,21 +540,18 @@ def export_historical_to_db(dict_df, granularity):
         pattern = f'{symbol_pattern_escaped}\\_%'
         
         # Fetch all existing tables matching the pattern
-        cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ? ESCAPE '\\'", (pattern,))
-        existing_tables = cursor.fetchall()
+        query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME LIKE ? ESCAPE '\\'"
+        existing_tables = db.read_sql_query(query, params={'pattern': pattern})
         
         # Drop all existing tables that match the pattern
-        for existing_table in existing_tables:
-            cursor.execute(f'DROP TABLE IF EXISTS \"{existing_table[0]}\"')
-            #print(f"Dropped table: {existing_table[0]}")
+        for existing_table in existing_tables['TABLE_NAME']:
+            drop_table_query = f'DROP TABLE IF EXISTS \"{existing_table}\"'
+            db.execute_sql(drop_table_query)
         
         # Write the DataFrame to the new table
         df.drop_duplicates(subset=None, keep='first', inplace=True, ignore_index=False)
-        df.to_sql(new_table_name, conn, if_exists='replace', index=True)
-        #print(f"\nCreated table: {new_table_name}")
-    
-    conn.commit()
-    conn.close()
+        db.to_sql(df, new_table_name, if_exists='replace', index=True)
+    return
 
 
 def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None, socketio=None):
@@ -638,7 +650,7 @@ def get_metrics_from_backtest(strategy_object, multiple=False, multiple_dict=Non
 
 def export_backtest_to_db(object, multiple_table_name=None, is_combined=False):
     """Exports strategy backtest results to the database."""
-    conn = sql.connect(f'{db_path}/backtest.db')
+    db = MSSQLDatabase('backtest')
 
     if not isinstance(object, pd.DataFrame):
         # Handle Strategy object
@@ -655,11 +667,11 @@ def export_backtest_to_db(object, multiple_table_name=None, is_combined=False):
             table_name = f"{strategy_object.__class__.__name__}_{granularity}"
 
         # Ensure the table exists
-        _create_table_if_not_exists(table_name, backtest_df, conn)
+        db.create_table_if_not_exists(table_name, backtest_df)
 
         # Prepare the DELETE query
-        delete_query = f'DELETE FROM "{table_name}" WHERE symbol = ?'
-        param_query = (symbol,)
+        delete_query = f'DELETE FROM "{table_name}" WHERE symbol = @symbol'
+        param_query = {'symbol': symbol}
 
     else:
         # Handle DataFrame directly
@@ -668,22 +680,19 @@ def export_backtest_to_db(object, multiple_table_name=None, is_combined=False):
         table_name = f"{multiple_table_name}_{granularity}"
 
         # Ensure the table exists
-        _create_table_if_not_exists(table_name, backtest_df, conn)
+        db.create_table_if_not_exists(table_name, backtest_df)
 
         # Prepare the DELETE query
         symbol = backtest_df['symbol'].unique()[0]
-        delete_query = f'DELETE FROM "{table_name}" WHERE symbol = ?'
-        param_query = (symbol,)
+        delete_query = f'DELETE FROM "{table_name}" WHERE symbol = @symbol'
+        param_query = {'symbol': symbol}
 
     # Step 1: Delete existing rows with the same symbol
-    cursor = conn.cursor()
-    cursor.execute(delete_query, param_query)
-    conn.commit()
+    db.execute_sql(delete_query, param_query)
 
     # Step 2: Insert the updated data
-    backtest_df.to_sql(table_name, conn, if_exists='append', index=False)
+    db.to_sql(backtest_df, table_name, if_exists='append', index=False)
 
-    conn.close()
     return
 
 
@@ -723,32 +732,30 @@ def trade_export(response_json, balance, order_type="spot"):
     }
     trade_df = pd.DataFrame([trade_data])
 
-    db_path = f'core/database/trades.db'
+
+    db = MSSQLDatabase('trades')
     table_name = 'trade_data'
 
-    conn = sql.connect(db_path)
-    _create_table_if_not_exists(table_name, trade_df, conn)
+    db.create_table_if_not_exists(table_name, trade_df)
 
-    trade_df.to_sql(table_name, conn, if_exists='append', index=False)
-
-    conn.commit()
-    conn.close()
+    db.to_sql(trade_df, table_name, if_exists='append', index=False)
 
     print("Trade exported successfully.")
 
 def export_optimization_results_to_db(study, strategy_class):
         """Export Bayesian optimization results to the database."""
-        conn = sql.connect(f'{db_path}/hyper_optuna.db')
+        db = MSSQLDatabase('hyper_optuna')
         table_name = f"OptunaOptimization_{strategy_class.__name__}"
 
         # Create table if it doesn't exist
-        conn.execute(f"""
+        create_table_query = f"""
             CREATE TABLE IF NOT EXISTS "{table_name}" (
                 trial_id INTEGER PRIMARY KEY,
-                params TEXT,
+                params NVARCHAR(MAX),
                 value REAL
             )
-        """)
+        """
+        db.execute_sql(create_table_query)
 
         # Insert the results
         for trial in study.trials:
@@ -756,221 +763,214 @@ def export_optimization_results_to_db(study, strategy_class):
             value = trial.value
             
             # Check if trial_id already exists
-            cursor = conn.execute(f"SELECT COUNT(1) FROM {table_name} WHERE trial_id = ?", (trial.number,))
-            exists = cursor.fetchone()[0]
+            check_query = f"SELECT COUNT(1) FROM {table_name} WHERE trial_id = @trial_id"
+            result = db.read_sql_query(check_query, params={'trial_id': trial.number})
+            exists = result.iloc[0, 0]
             
             if exists == 0:
                 # If trial_id doesn't exist, insert it
-                conn.execute(f"""
+                insert_query = f"""
                     INSERT INTO "{table_name}" (trial_id, params, value)
-                    VALUES (?, ?, ?)
-                """, (trial.number, params, value))
-
-        conn.commit()
-        conn.close()    
+                    VALUES (@trial_id, @params, @value)
+                """
+                db.execute_sql(insert_query, params={'trial_id': trial.number, 'params': params, 'value': value})
         
 def export_optimization_summary_to_db(results_df, strategy_name):
     """Export optimization summary results to the database."""
-    conn = sql.connect(f'{db_path}/hyper_optuna.db')
+    db = MSSQLDatabase('hyper_optuna')
     table_name = f"OptimizationSummary_{strategy_name}"
 
     # Create table if it doesn't exist
-    conn.execute(f"""
+    create_table_query = f"""
         CREATE TABLE IF NOT EXISTS "{table_name}" (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            granularity TEXT,
+            id INTEGER PRIMARY KEY IDENTITY(1,1),
+            symbol NVARCHAR(255),
+            granularity NVARCHAR(255),
             best_value REAL,
-            best_params TEXT,
+            best_params NVARCHAR(MAX),
             n_trials INTEGER,
-            timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+            timestamp DATETIME2 DEFAULT GETDATE()
         )
-    """)
-
-    # Insert the results
-    for _, row in results_df.iterrows():
-        conn.execute(f"""
-            INSERT INTO "{table_name}" (symbol, granularity, best_value, best_params, n_trials)
-            VALUES (?, ?, ?, ?, ?)
-        """, (
-            row['symbol'],
-            row['granularity'],
-            row['best_value'],
-            str(row['best_params']),
-            row['n_trials']
-        ))
-
-    conn.commit()
-    conn.close()
-# def export_optimization_results(df):
-#     try:
-#         conn = sql.connect(f'{db_path}/ai_optimization.db')
-#         print("Connected to database successfully.")
-#         _create_table_if_not_exists('ai_optimization_results', df, conn)
-        
-#         # Check for unsupported types
-#         print("Verifying DataFrame types:")
-#         print(df.dtypes)
-        
-#         print("Exporting results to the database...")
-#         df.to_sql('optimization_results', conn, if_exists='append', index=False)
-#         print("Data exported successfully.")
-#     except Exception as e:
-#         print(f"Error occurred while exporting optimization results: {e}")
-#     finally:
-#         conn.close()
-#         print("Database connection closed.")
+    """
+    try:
+        db.execute_sql(create_table_query)
+        # Insert the results
+        for _, row in results_df.iterrows():
+            insert_query = f"""
+                INSERT INTO "{table_name}" (symbol, granularity, best_value, best_params, n_trials)
+                VALUES (@symbol, @granularity, @best_value, @best_params, @n_trials)
+            """
+            params = {
+                'symbol': row['symbol'],
+                'granularity': row['granularity'],
+                'best_value': row['best_value'],
+                'best_params': str(row['best_params']),
+                'n_trials': row['n_trials']
+            }
+            db.execute_sql(insert_query, params)
+    except Exception as e:
+        logger.error(f"Error exporting optimization summary to database: {e}")
 
 from contextlib import contextmanager
 import json
 import threading
 from threading import Lock
-import sqlite3 as sql
 import pandas as pd
 import os
 
 # Use your existing database connection logic
 @contextmanager
 def get_db_connection(db_name):
-    db_lock = Lock()
-    with db_lock:
-        conn = sql.connect(f'{db_path}/{db_name}.db')
-        try:
-            yield conn
-        finally:
-            conn.close()
+    db = MSSQLDatabase(db_name)
+    try:
+        yield db.engine
+    finally:
+        pass
 
-def initialize_backtest_tables(conn):
+def initialize_backtest_tables(db):
     """Create tables to store backtest results if they don't exist"""
-    cursor = conn.cursor()
-    
-    # Table for overall backtest results
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS backtest_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        symbol TEXT,
-        granularity TEXT,
-        start_date TEXT,
-        end_date TEXT,
-        initial_capital REAL,
-        final_value REAL,
-        total_return REAL,
-        annualized_return REAL,
-        sharpe_ratio REAL,
-        max_drawdown REAL,
-        total_trades INTEGER,
-        win_rate REAL,
-        timestamp TEXT
-    )
-    ''')
-    
-    # Table for model metrics
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS model_metrics (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        backtest_id INTEGER,
-        accuracy REAL,
-        precision REAL,
-        recall REAL,
-        f1_score REAL,
-        FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
-    )
-    ''')
-    
-    # Table for feature importance
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS feature_importance (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        backtest_id INTEGER,
-        feature_name TEXT,
-        importance_value REAL,
-        FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
-    )
-    ''')
-    
-    # Table for individual trades
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS trades (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        backtest_id INTEGER,
-        entry_date TEXT,
-        exit_date TEXT,
-        entry_price REAL,
-        exit_price REAL,
-        position_size REAL,
-        profit_loss REAL,
-        trade_return REAL,
-        FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
-    )
-    ''')
-    
-    # Table for WFO results
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS wfo_results (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        backtest_id INTEGER,
-        window_number INTEGER,
-        train_start TEXT,
-        train_end TEXT,
-        test_start TEXT,
-        test_end TEXT,
-        accuracy REAL,
-        strategy_return REAL,
-        buy_hold_return REAL,
-        win_rate REAL,
-        trades INTEGER,
-        FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
-    )
-    ''')
-    
-    conn.commit()
+    try:
+        # Table for overall backtest results
+        create_table_results = """
+        CREATE TABLE IF NOT EXISTS backtest_results (
+            id INTEGER PRIMARY KEY IDENTITY(1,1),
+            symbol NVARCHAR(255),
+            granularity NVARCHAR(255),
+            start_date NVARCHAR(255),
+            end_date NVARCHAR(255),
+            initial_capital REAL,
+            final_value REAL,
+            total_return REAL,
+            annualized_return REAL,
+            sharpe_ratio REAL,
+            max_drawdown REAL,
+            total_trades INTEGER,
+            win_rate REAL,
+            timestamp DATETIME2 DEFAULT GETDATE()
+        )
+        """
+        db.execute_sql(create_table_results)
+        
+        # Table for model metrics
+        create_table_metrics = """
+        CREATE TABLE IF NOT EXISTS model_metrics (
+            id INTEGER PRIMARY KEY IDENTITY(1,1),
+            backtest_id INTEGER,
+            accuracy REAL,
+            precision REAL,
+            recall REAL,
+            f1_score REAL,
+            FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
+        )
+        """
+        db.execute_sql(create_table_metrics)
+
+        # Table for feature importance
+        create_table_importance = """
+        CREATE TABLE IF NOT EXISTS feature_importance (
+            id INTEGER PRIMARY KEY IDENTITY(1,1),
+            backtest_id INTEGER,
+            feature_name NVARCHAR(255),
+            importance_value REAL,
+            FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
+        )
+        """
+        db.execute_sql(create_table_importance)
+        
+        # Table for individual trades
+        create_table_trades = """
+        CREATE TABLE IF NOT EXISTS trades (
+            id INTEGER PRIMARY KEY IDENTITY(1,1),
+            backtest_id INTEGER,
+            entry_date NVARCHAR(255),
+            exit_date NVARCHAR(255),
+            entry_price REAL,
+            exit_price REAL,
+            position_size REAL,
+            profit_loss REAL,
+            trade_return REAL,
+            FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
+        )
+        """
+        db.execute_sql(create_table_trades)
+        
+        # Table for WFO results
+        create_table_wfo = """
+        CREATE TABLE IF NOT EXISTS wfo_results (
+            id INTEGER PRIMARY KEY IDENTITY(1,1),
+            backtest_id INTEGER,
+            window_number INTEGER,
+            train_start NVARCHAR(255),
+            train_end NVARCHAR(255),
+            test_start NVARCHAR(255),
+            test_end NVARCHAR(255),
+            accuracy REAL,
+            strategy_return REAL,
+            buy_hold_return REAL,
+            win_rate REAL,
+            trades INTEGER,
+            FOREIGN KEY (backtest_id) REFERENCES backtest_results(id)
+        )
+        """
+        db.execute_sql(create_table_wfo)
+    except Exception as e:
+         logger.error(f"Error initializing tables in database: {e}")
+
 
 def save_backtest_results(backtest_obj):
     """Save backtest results to database"""
+    db = MSSQLDatabase('ai_backtest')
     try:
-        with get_db_connection('ai_backtest') as conn:
             # Initialize tables if they don't exist
-            initialize_backtest_tables(conn)
+            initialize_backtest_tables(db)
             
             # Extract backtest results
             results = backtest_obj.backtest_results
             
             # Insert backtest results
-            cursor = conn.cursor()
-            cursor.execute('''
+            insert_backtest_results = """
             INSERT INTO backtest_results 
             (symbol, granularity, start_date, end_date, initial_capital, 
             final_value, total_return, annualized_return, sharpe_ratio, 
-            max_drawdown, total_trades, win_rate, timestamp)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, datetime('now'))
-            ''', (
-                backtest_obj.symbol,
-                backtest_obj.granularity,
-                str(backtest_obj.backtest_data.index[0]),
-                str(backtest_obj.backtest_data.index[-1]),
-                results['Initial Capital'],
-                results['Final Value'],
-                results['Total Return (%)'],
-                results['Annualized Return (%)'],
-                results['Sharpe Ratio'],
-                results['Max Drawdown (%)'],
-                results['Total Trades'],
-                results['Win Rate (%)']
-            ))
+            max_drawdown, total_trades, win_rate)
+            VALUES (@symbol, @granularity, @start_date, @end_date, @initial_capital, 
+            @final_value, @total_return, @annualized_return, @sharpe_ratio, 
+            @max_drawdown, @total_trades, @win_rate)
+            """
+
+            params = {
+                'symbol': backtest_obj.symbol,
+                'granularity': backtest_obj.granularity,
+                'start_date': str(backtest_obj.backtest_data.index[0]),
+                'end_date': str(backtest_obj.backtest_data.index[-1]),
+                'initial_capital': results['Initial Capital'],
+                'final_value': results['Final Value'],
+                'total_return': results['Total Return (%)'],
+                'annualized_return': results['Annualized Return (%)'],
+                'sharpe_ratio': results['Sharpe Ratio'],
+                'max_drawdown': results['Max Drawdown (%)'],
+                'total_trades': results['Total Trades'],
+                'win_rate': results['Win Rate (%)']
+            }
+            db.execute_sql(insert_backtest_results, params)
             
-            # Get the ID of the inserted backtest
-            backtest_id = cursor.lastrowid
+            # Get the ID of the inserted backtest (SQL Server uses SCOPE_IDENTITY())
+            result = db.read_sql_query("SELECT SCOPE_IDENTITY() AS id")
+            backtest_id = int(result['id'][0])
+
             
             # Save feature importance
             for _, row in backtest_obj.feature_importance.iterrows():
-                cursor.execute('''
+                insert_feature_importance = """
                 INSERT INTO feature_importance (backtest_id, feature_name, importance_value)
-                VALUES (?, ?, ?)
-                ''', (
-                    backtest_id,
-                    row['Feature'],
-                    row['Importance']
-                ))
+                VALUES (@backtest_id, @feature_name, @importance_value)
+                """
+                params = {
+                    'backtest_id': backtest_id,
+                    'feature_name': row['Feature'],
+                    'importance_value': row['Importance']
+                }
+                db.execute_sql(insert_feature_importance, params)
             
             # Extract and save individual trades
             if hasattr(backtest_obj, 'backtest_data'):
@@ -999,45 +999,50 @@ def save_backtest_results(backtest_obj):
                             trade_return = (exit_price / entry_price) - 1
                             
                             # Save trade
-                            cursor.execute('''
+                            insert_trade = """
                             INSERT INTO trades
                             (backtest_id, entry_date, exit_date, entry_price, exit_price, 
                             position_size, profit_loss, trade_return)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                            ''', (
-                                backtest_id,
-                                str(buy_date),
-                                str(sell_date),
-                                entry_price,
-                                exit_price,
-                                position_size,
-                                profit_loss,
-                                trade_return
-                            ))
+                            VALUES (@backtest_id, @entry_date, @exit_date, @entry_price, @exit_price, 
+                            @position_size, @profit_loss, @trade_return)
+                            """
+                            params = {
+                                'backtest_id': backtest_id,
+                                'entry_date': str(buy_date),
+                                'exit_date': str(sell_date),
+                                'entry_price': entry_price,
+                                'exit_price': exit_price,
+                                'position_size': position_size,
+                                'profit_loss': profit_loss,
+                                'trade_return': trade_return
+                            }
+                            db.execute_sql(insert_trade, params)
             
             # Save WFO results if they exist
             if hasattr(backtest_obj, 'wfo_results') and backtest_obj.wfo_results is not None:
                 for _, row in backtest_obj.wfo_results.iterrows():
-                    cursor.execute('''
+                    insert_wfo_results = """
                     INSERT INTO wfo_results
                     (backtest_id, window_number, train_start, train_end, test_start, test_end,
                     accuracy, strategy_return, buy_hold_return, win_rate, trades)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ''', (
-                        backtest_id,
-                        row['Window'],
-                        str(row['Train_Start']),
-                        str(row['Train_End']),
-                        str(row['Test_Start']),
-                        str(row['Test_End']),
-                        row['Accuracy'],
-                        row['Strategy_Return'],
-                        row['Buy_Hold_Return'],
-                        row['Win_Rate'],
-                        row['Trades']
-                    ))
+                    VALUES (@backtest_id, @window_number, @train_start, @train_end, @test_start, @test_end,
+                    @accuracy, @strategy_return, @buy_hold_return, @win_rate, @trades)
+                    """
+                    params = {
+                        'backtest_id': backtest_id,
+                        'window_number': row['Window'],
+                        'train_start': str(row['Train_Start']),
+                        'train_end': str(row['Train_End']),
+                        'test_start': str(row['Test_Start']),
+                        'test_end': str(row['Test_End']),
+                        'accuracy': row['Accuracy'],
+                        'strategy_return': row['Strategy_Return'],
+                        'buy_hold_return': row['Buy_Hold_Return'],
+                        'win_rate': row['Win_Rate'],
+                        'trades': row['Trades']
+                    }
+                    db.execute_sql(insert_wfo_results, params)
             
-            conn.commit()
             return backtest_id
             
     except Exception as e:
@@ -1048,30 +1053,28 @@ def save_backtest_results(backtest_obj):
 
 def get_backtest_results(symbol=None, granularity=None, limit=10):
     """Retrieve backtest results from database with optional filtering"""
+    db = MSSQLDatabase('ai_backtest')
     try:
-        with get_db_connection('ai_backtest') as conn:
-            query = "SELECT * FROM backtest_results"
-            params = []
+        query = "SELECT * FROM backtest_results"
+        params = {}
+        conditions = []
+        
+        if symbol:
+            conditions.append("symbol = @symbol")
+            params['symbol'] = symbol
             
-            if symbol or granularity:
-                query += " WHERE"
-                
-                if symbol:
-                    query += " symbol = ?"
-                    params.append(symbol)
-                    
-                if symbol and granularity:
-                    query += " AND"
-                    
-                if granularity:
-                    query += " granularity = ?"
-                    params.append(granularity)
+        if granularity:
+            conditions.append("granularity = @granularity")
+            params['granularity'] = granularity
+        
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
             
-            query += " ORDER BY timestamp DESC LIMIT ?"
-            params.append(limit)
-            
-            results = pd.read_sql_query(query, conn, params=params)
-            return results
+        query += " ORDER BY timestamp DESC OFFSET 0 ROWS FETCH NEXT @limit ROWS ONLY"
+        params['limit'] = limit
+        
+        results = db.read_sql_query(query, params=params)
+        return results
             
     except Exception as e:
         logger.error(f"Error retrieving backtest results: {e}")
