@@ -25,13 +25,21 @@ def create_app(config_class=Config):
     # Enable CORS with more detailed configuration
     CORS(
         app,
-        origins='https://main.d1ygo5bg0er0wr.amplifyapp.com',
         resources={
-            r"/*": {"origins": "*"}
-        },
-        supports_credentials=True,
-        allow_headers=["Content-Type", "Authorization", "X-Requested-With"],
-        methods=["GET", "HEAD", "POST", "OPTIONS", "PUT", "PATCH", "DELETE"]
+            r"/*": {
+                "origins": "https://main.d1ygo5bg0er0wr.amplifyapp.com",
+                "supports_credentials": True,
+                "allow_headers": [
+                    "Content-Type",
+                    "Authorization",
+                    "X-Requested-With"
+                ],
+                "methods": [
+                    "GET", "HEAD", "POST", "OPTIONS", 
+                    "PUT", "PATCH", "DELETE"
+                ]
+            }
+        }
     )
     
     # Handle OPTIONS requests explicitly
