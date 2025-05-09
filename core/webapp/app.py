@@ -25,6 +25,7 @@ def create_app(config_class=Config):
     # Enable CORS with more detailed configuration
     CORS(
         app,
+        origins='https://main.d1ygo5bg0er0wr.amplifyapp.com',
         resources={
             r"/*": {"origins": "*"}
         },
