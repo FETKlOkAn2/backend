@@ -17,7 +17,7 @@ from tensorflow.keras.optimizers import Adam
 
 # Import project modules
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-import core.utils as utils
+import backend.core.utils.utils as utils
 import core.database_interaction as database_interaction
 from core.risk import Risk_Handler
 from core.hyper import Hyper

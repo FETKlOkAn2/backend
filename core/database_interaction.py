@@ -1,9 +1,10 @@
 import pandas as pd
-import core.utils as utils
+import backend.core.utils.utils as utils
 import inspect
 import numpy as np
 import sys
 import time
+from datetime import timedelta
 import gc
 import sys
 from datetime import datetime
@@ -13,6 +14,19 @@ import logging
 import json
 import pandas as pd
 import logging
+import sqlite3 as sql
+import datetime
+import json
+import logging
+import os
+import sys
+import secrets
+import hashlib
+from typing import Dict, List, Optional, Any, Tuple, Union
+import uuid
+
+from core.utils.encryption_utils import encrypt_api_key, decrypt_api_key
+from core.utils.api_key_tester import ApiKeyTester
 
 # Suppress debug logs from libraries
 logging.getLogger("numba").setLevel(logging.WARNING)
@@ -124,17 +138,6 @@ def get_historical_from_db(granularity, symbols: list = [], num_days: int = None
 
     db_file = f'{granularity}'
     db = MSSQLDatabase(db_file)
-
-    # Ensure database path exists
-    if not os.path.exists(db_path):
-        logger.error(f"Database path {db_path} does not exist!")
-        return {}
-        
-    # Ensure the database file exists
-    db_file_path = f'{db_path}/{granularity}'
-    if not os.path.exists(db_file_path):
-        logger.error(f"Database file {db_file_path} does not exist!")
-        return {}
 
     try:
         query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
@@ -325,42 +328,6 @@ def export_optimization_results(df):
         print(f"Error occurred while exporting optimization results: {e}")
     finally:
         pass
-# def _create_table_if_not_exists(table_name, df, conn):
-#     """ Helper function to create table if it doesn't exist """
-#     try:
-#         # Check if the table exists
-#         print(f"Checking if table {table_name} exists...")
-#         table_exists_query = f"SELECT name FROM sqlite_master WHERE type='table' AND name='{table_name}';"
-#         table_exists = pd.read_sql(table_exists_query, conn)
-#         print("Table existence check completed.")
-        
-#         if table_exists.empty:
-#             # Create table if it does not exist
-#             print(f"Table {table_name} doesn't exist. Creating table...")
-#             columns = df.columns
-#             dtypes = df.dtypes  
-#             sql_dtypes = []
-#             for col in columns:
-#                 dtype = dtypes[col]
-#                 if pd.api.types.is_integer_dtype(dtype):
-#                     sql_dtype = 'INTEGER'
-#                 elif pd.api.types.is_float_dtype(dtype):
-#                     sql_dtype = 'REAL'
-#                 else:
-#                     sql_dtype = 'TEXT'
-#                 sql_dtypes.append(f'"{col}" {sql_dtype}')
-            
-#             create_table_query = f"CREATE TABLE {table_name} ("
-#             create_table_query += ', '.join(sql_dtypes)
-#             create_table_query += ");"
-#             print(f"Creating table with query:\n{create_table_query}")
-            
-#             cursor = conn.cursor()
-#             cursor.execute(create_table_query)
-#             conn.commit()
-#             print(f"Table {table_name} created successfully.")
-#     except Exception as e:
-#         print(f"Error occurred while creating table {table_name}: {e}")
 
 def get_best_params_without_df(strategy_name, symbol, granularity, minimum_trades=None):
     db = MSSQLDatabase('hyper')
@@ -1079,3 +1046,1723 @@ def get_backtest_results(symbol=None, granularity=None, limit=10):
     except Exception as e:
         logger.error(f"Error retrieving backtest results: {e}")
         return pd.DataFrame()
+
+
+#
+#   DB API KEY FUNCTIONS
+#   ---------------------
+#   These functions are used to manage API keys in the database.
+#   They include creating, updating, and deleting API keys for users.
+#   The API keys are stored in a database table and can be retrieved as needed.
+#   The functions also include error handling and logging for better debugging.
+
+
+def setup_api_keys_table(db):
+    """
+    Create API keys table and audit table if they don't exist
+    
+    Args:
+        db: MSSQLDatabase instance
+    """
+    try:
+        # Create API keys table with encrypted storage
+        db.execute_sql("""
+            IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'api_keys')
+            BEGIN
+                CREATE TABLE api_keys (
+                    id INT IDENTITY(1,1) PRIMARY KEY,
+                    uuid NVARCHAR(50) UNIQUE NOT NULL,
+                    email NVARCHAR(255) NOT NULL,
+                    platform NVARCHAR(50) NOT NULL,
+                    api_key NVARCHAR(MAX) NOT NULL,
+                    api_secret NVARCHAR(MAX) NOT NULL,
+                    passphrase NVARCHAR(MAX),
+                    created_at NVARCHAR(50) NOT NULL,
+                    updated_at NVARCHAR(50) NOT NULL,
+                    last_used NVARCHAR(50),
+                    is_active BIT DEFAULT 1,
+                    metadata NVARCHAR(MAX),
+                    last_verified NVARCHAR(50),
+                    verification_status NVARCHAR(50),
+                    key_hash NVARCHAR(255),
+                    CONSTRAINT FK_api_keys_users FOREIGN KEY (email) REFERENCES users(email),
+                    CONSTRAINT UQ_email_platform UNIQUE(email, platform)
+                )
+            END
+        """)
+        
+        # Create API key audit log table
+        db.execute_sql("""
+            IF NOT EXISTS (SELECT * FROM sys.tables WHERE name = 'api_key_audit_log')
+            BEGIN
+                CREATE TABLE api_key_audit_log (
+                    id INT IDENTITY(1,1) PRIMARY KEY,
+                    api_key_id NVARCHAR(50),
+                    email NVARCHAR(255) NOT NULL,
+                    platform NVARCHAR(50) NOT NULL,
+                    action NVARCHAR(50) NOT NULL,
+                    timestamp NVARCHAR(50) NOT NULL,
+                    ip_address NVARCHAR(50),
+                    user_agent NVARCHAR(MAX),
+                    status NVARCHAR(50),
+                    details NVARCHAR(MAX),
+                    CONSTRAINT FK_audit_log_api_keys FOREIGN KEY (api_key_id) REFERENCES api_keys(uuid)
+                )
+            END
+        """)
+        
+        logger.info("API keys and audit tables setup complete")
+    except Exception as e:
+        logger.error(f"Error setting up API keys table: {str(e)}")
+        raise
+
+
+def generate_user_secret(email, platform):
+    """
+    Generate a strong, user-specific secret for encryption
+    
+    Args:
+        email: User's email
+        platform: Platform name
+    
+    Returns:
+        str: A user-specific secret
+    """
+    # Create a deterministic but secure secret based on user info
+    # This ensures we can regenerate the same secret for decryption
+    base_secret = f"{email}:{platform}:{os.environ.get('USER_SECRET_SALT', 'DEFAULT_SALT')}"
+    return hashlib.sha256(base_secret.encode()).hexdigest()
+
+
+def calculate_key_hash(api_key, platform):
+    """
+    Calculate a hash of the API key to identify changes without storing the key
+    
+    Args:
+        api_key: The API key
+        platform: The platform
+    
+    Returns:
+        str: A one-way hash of the API key
+    """
+    key_data = f"{api_key}:{platform}"
+    return hashlib.sha256(key_data.encode()).hexdigest()
+
+
+def log_api_key_action(
+    db,
+    email,
+    platform,
+    action,
+    status,
+    api_key_id=None,
+    details=None,
+    ip_address=None,
+    user_agent=None
+):
+    """
+    Log an API key related action for audit purposes
+    
+    Args:
+        db: MSSQLDatabase instance
+        email: User's email
+        platform: Platform name
+        action: Action performed (save, get, delete, etc.)
+        status: Outcome status (success, failed, etc.)
+        api_key_id: Optional UUID of the API key
+        details: Optional additional details
+        ip_address: Optional IP address of the requestor
+        user_agent: Optional user agent of the requestor
+    """
+    try:
+        timestamp = datetime.datetime.now().isoformat()
+        
+        db.execute_sql("""
+            INSERT INTO api_key_audit_log
+            (api_key_id, email, platform, action, timestamp, ip_address, user_agent, status, details)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            api_key_id,
+            email,
+            platform,
+            action,
+            timestamp,
+            ip_address,
+            user_agent,
+            status,
+            details
+        ))
+        
+    except Exception as e:
+        logger.error(f"Error logging API key action: {str(e)}")
+
+
+def save_api_keys(
+    db,
+    email, 
+    platform, 
+    api_key, 
+    api_secret, 
+    passphrase=None, 
+    metadata=None
+):
+    """
+    Save encrypted API keys for a user's trading platform with verification
+    
+    Args:
+        db: MSSQLDatabase instance
+        email: User's email
+        platform: Trading platform name (e.g., 'coinbase', 'kraken')
+        api_key: API key to encrypt and store
+        api_secret: API secret to encrypt and store
+        passphrase: Optional passphrase for platforms that require it
+        metadata: Optional JSON metadata about the API key
+    
+    Returns:
+        bool: Success or failure
+    """
+    try:
+        # Create tables if they don't exist
+        setup_api_keys_table(db)
+        
+        # Verify API keys before saving
+        verification = ApiKeyTester.test_api_connection(
+            platform, 
+            api_key, 
+            api_secret, 
+            passphrase
+        )
+        
+        if verification["status"] != "success":
+            logger.warning(f"API key verification failed for {email} on {platform}: {verification['message']}")
+            log_api_key_action(
+                db,
+                email=email,
+                platform=platform,
+                action="save",
+                status="failed",
+                details=f"Verification failed: {verification['message']}",
+                ip_address=metadata.get("ip_address") if metadata else None,
+                user_agent=metadata.get("user_agent") if metadata else None
+            )
+            return False
+        
+        # Generate a user-specific secret
+        user_secret = generate_user_secret(email, platform)
+        
+        # Calculate key hash for change detection
+        key_hash = calculate_key_hash(api_key, platform)
+        
+        # Encrypt sensitive data
+        encrypted_api_key = encrypt_api_key(api_key, user_secret)
+        encrypted_api_secret = encrypt_api_key(api_secret, user_secret)
+        encrypted_passphrase = None
+        if passphrase:
+            encrypted_passphrase = encrypt_api_key(passphrase, user_secret)
+        
+        # Current timestamp
+        now = datetime.datetime.now().isoformat()
+        
+        # Begin transaction
+        # Check if this user already has keys for this platform
+        result = db.read_sql_query(
+            "SELECT uuid, key_hash FROM api_keys WHERE email = ? AND platform = ?",
+            (email, platform)
+        )
+        
+        api_key_id = None
+        
+        if not result.empty:
+            # Update existing keys
+            existing = result.iloc[0]
+            api_key_id = existing['uuid']
+            
+            # Only update if key has changed (based on hash)
+            if existing['key_hash'] != key_hash:
+                db.execute_sql("""
+                    UPDATE api_keys
+                    SET api_key = ?, api_secret = ?, passphrase = ?, 
+                        updated_at = ?, is_active = 1, metadata = ?,
+                        last_verified = ?, verification_status = ?, key_hash = ?
+                    WHERE email = ? AND platform = ?
+                """, (
+                    encrypted_api_key, 
+                    encrypted_api_secret, 
+                    encrypted_passphrase,
+                    now,
+                    json.dumps(metadata) if metadata else None,
+                    now,
+                    "verified",
+                    key_hash,
+                    email, 
+                    platform
+                ))
+                logger.info(f"Updated API keys for user {email} on platform {platform}")
+            else:
+                # Just update verification status
+                db.execute_sql("""
+                    UPDATE api_keys
+                    SET last_verified = ?, verification_status = ?, is_active = 1
+                    WHERE email = ? AND platform = ?
+                """, (
+                    now,
+                    "verified",
+                    email, 
+                    platform
+                ))
+                logger.info(f"Verified existing API keys for user {email} on platform {platform}")
+        else:
+            # Create a new UUID for this API key
+            api_key_id = str(uuid.uuid4())
+            
+            # Insert new keys
+            db.execute_sql("""
+                INSERT INTO api_keys 
+                (uuid, email, platform, api_key, api_secret, passphrase, created_at, updated_at, 
+                 metadata, is_active, last_verified, verification_status, key_hash)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)
+            """, (
+                api_key_id,
+                email, 
+                platform, 
+                encrypted_api_key, 
+                encrypted_api_secret, 
+                encrypted_passphrase,
+                now, 
+                now,
+                json.dumps(metadata) if metadata else None,
+                now,
+                "verified",
+                key_hash
+            ))
+            logger.info(f"Inserted new API keys for user {email} on platform {platform}")
+        
+        # Update platform connection if exists
+        result = db.read_sql_query(
+            "SELECT id FROM platform_connections WHERE email = ?", 
+            (email,)
+        )
+        
+        if not result.empty:
+            db.execute_sql(
+                """UPDATE platform_connections 
+                   SET platform = ?, timestamp = ?, api_key = ?, api_secret = ? 
+                   WHERE email = ?""", 
+                (platform, now, encrypted_api_key, encrypted_api_secret, email)
+            )
+        else:
+            db.execute_sql(
+                """INSERT INTO platform_connections (email, platform, timestamp, api_key, api_secret)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (email, platform, now, encrypted_api_key, encrypted_api_secret)
+            )
+        
+        # Update user setup status 
+        db.execute_sql(
+            """UPDATE users 
+               SET platform_connected = ?, keys_configured = ? 
+               WHERE email = ?""",
+            (1, 1, email)
+        )
+        
+        # Log successful action
+        log_api_key_action(
+            db,
+            email=email,
+            platform=platform,
+            action="save",
+            status="success",
+            api_key_id=api_key_id,
+            ip_address=metadata.get("ip_address") if metadata else None,
+            user_agent=metadata.get("user_agent") if metadata else None
+        )
+        
+        logger.info(f"API keys saved successfully for user {email} on platform {platform}")
+        return True
+    except Exception as e:
+        logger.error(f"Error saving API keys for {email} on {platform}: {str(e)}")
+        
+        # Log failed action
+        log_api_key_action(
+            db,
+            email=email,
+            platform=platform,
+            action="save",
+            status="error",
+            details=str(e),
+            ip_address=metadata.get("ip_address") if metadata else None,
+            user_agent=metadata.get("user_agent") if metadata else None
+        )
+        
+        return False
+
+
+def get_api_keys(db, email, platform):
+    """
+    Get decrypted API keys for a user's trading platform
+    
+    Args:
+        db: MSSQLDatabase instance
+        email: User's email
+        platform: Trading platform name
+    
+    Returns:
+        dict: Decrypted API credentials or None if not found
+    """
+    try:
+        # Generate the user-specific secret
+        user_secret = generate_user_secret(email, platform)
+        
+        result = db.read_sql_query(
+            """SELECT uuid, api_key, api_secret, passphrase, is_active, verification_status 
+               FROM api_keys 
+               WHERE email = ? AND platform = ?""",
+            (email, platform)
+        )
+        
+        if result.empty or not result.iloc[0]['is_active']:
+            logger.warning(f"No active API keys found for {email} on {platform}")
+            return None
+        
+        row = result.iloc[0]
+        api_key_id = row['uuid']
+        encrypted_api_key = row['api_key']
+        encrypted_api_secret = row['api_secret']
+        encrypted_passphrase = row['passphrase']
+        
+        # Update last used timestamp
+        now = datetime.datetime.now().isoformat()
+        db.execute_sql(
+            "UPDATE api_keys SET last_used = ? WHERE uuid = ?",
+            (now, api_key_id)
+        )
+        
+        # Log access
+        log_api_key_action(
+            db,
+            email=email,
+            platform=platform,
+            action="access",
+            status="success",
+            api_key_id=api_key_id
+        )
+        
+        # Decrypt the keys
+        try:
+            credentials = {
+                "apiKey": decrypt_api_key(encrypted_api_key, user_secret),
+                "apiSecret": decrypt_api_key(encrypted_api_secret, user_secret)
+            }
+            
+            if encrypted_passphrase:
+                credentials["passphrase"] = decrypt_api_key(encrypted_passphrase, user_secret)
+            
+            return credentials
+        except Exception as e:
+            logger.error(f"Error decrypting API keys for {email} on {platform}: {str(e)}")
+            
+            # Log decryption failure
+            log_api_key_action(
+                db,
+                email=email,
+                platform=platform,
+                action="access",
+                status="error",
+                api_key_id=api_key_id,
+                details=f"Decryption error: {str(e)}"
+            )
+            
+            return None
+    except Exception as e:
+        logger.error(f"Error getting API keys for {email} on {platform}: {str(e)}")
+        
+        # Log general error
+        log_api_key_action(
+            db,
+            email=email,
+            platform=platform,
+            action="access",
+            status="error",
+            details=str(e)
+        )
+        
+        return None
+
+
+def verify_api_keys(db, email, platform):
+    """
+    Verify that stored API keys for a platform are still valid
+    
+    Args:
+        db: MSSQLDatabase instance
+        email: User's email
+        platform: Trading platform name
+    
+    Returns:
+        dict: Verification result with status and message
+    """
+    try:
+        # Get the decrypted API keys
+        credentials = get_api_keys(db, email, platform)
+        
+        if not credentials:
+            return {
+                "status": "error",
+                "message": f"No API keys found for {platform}"
+            }
+        
+        # Test the API connection
+        verification = ApiKeyTester.test_api_connection(
+            platform, 
+            credentials.get("apiKey"), 
+            credentials.get("apiSecret"), 
+            credentials.get("passphrase")
+        )
+        
+        # Update verification status in database
+        now = datetime.datetime.now().isoformat()
+        
+        db.execute_sql(
+            """UPDATE api_keys 
+               SET last_verified = ?, verification_status = ? 
+               WHERE email = ? AND platform = ?""",
+            (
+                now,
+                "verified" if verification["status"] == "success" else "failed",
+                email,
+                platform
+            )
+        )
+        
+        # Log verification result
+        log_api_key_action(
+            db,
+            email=email,
+            platform=platform,
+            action="verify",
+            status=verification["status"],
+            details=verification.get("message", "")
+        )
+        
+        return verification
+    except Exception as e:
+        logger.error(f"Error verifying API keys for {email} on {platform}: {str(e)}")
+        return {
+            "status": "error",
+            "message": f"Error verifying API keys: {str(e)}"
+        }
+
+
+def delete_api_keys(db, email, platform, metadata=None):
+    """
+    Delete API keys for a user's trading platform
+    
+    Args:
+        db: MSSQLDatabase instance
+        email: User's email
+        platform: Trading platform name
+        metadata: Optional metadata about the request
+    
+    Returns:
+        bool: Success or failure
+    """
+    try:
+        # Get API key ID before deleting
+        result = db.read_sql_query(
+            "SELECT uuid FROM api_keys WHERE email = ? AND platform = ?",
+            (email, platform)
+        )
+        api_key_id = result.iloc[0]['uuid'] if not result.empty else None
+        
+        # Mark as inactive instead of deleting
+        db.execute_sql(
+            """UPDATE api_keys 
+               SET is_active = 0, updated_at = ? 
+               WHERE email = ? AND platform = ?""",
+            (datetime.datetime.now().isoformat(), email, platform)
+        )
+        
+        # Also update platform connection if needed
+        db.execute_sql(
+            """UPDATE platform_connections 
+               SET api_key = NULL, api_secret = NULL 
+               WHERE email = ? AND platform = ?""", 
+            (email, platform)
+        )
+        
+        # Update user keys_configured status if this was their only platform
+        result = db.read_sql_query(
+            """SELECT COUNT(*) as count
+               FROM api_keys 
+               WHERE email = ? AND is_active = 1""",
+            (email,)
+        )
+        remaining_keys = result.iloc[0]['count']
+        
+        if remaining_keys == 0:
+            db.execute_sql(
+                """UPDATE users 
+                   SET keys_configured = 0 
+                   WHERE email = ?""",
+                (email,)
+            )
+        
+        # Log successful deletion
+        log_api_key_action(
+            db,
+            email=email,
+            platform=platform,
+            action="delete",
+            status="success",
+            api_key_id=api_key_id,
+            ip_address=metadata.get("ip_address") if metadata else None,
+            user_agent=metadata.get("user_agent") if metadata else None
+        )
+        
+        logger.info(f"API keys deleted for user {email} on platform {platform}")
+        return True
+    except Exception as e:
+        logger.error(f"Error deleting API keys for {email} on {platform}: {str(e)}")
+        
+        # Log failed deletion
+        log_api_key_action(
+            db,
+            email=email,
+            platform=platform,
+            action="delete",
+            status="error",
+            details=str(e),
+            ip_address=metadata.get("ip_address") if metadata else None,
+            user_agent=metadata.get("user_agent") if metadata else None
+        )
+        
+        return False
+
+
+def get_api_key_info(db, email, platform=None):
+    """
+    Get information about stored API keys without revealing secrets
+    
+    Args:
+        db: MSSQLDatabase instance
+        email: User's email
+        platform: Optional platform name (if None, get for all platforms)
+    
+    Returns:
+        list: List of API key information dictionaries
+    """
+    try:
+        if platform:
+            result = db.read_sql_query(
+                """SELECT uuid, platform, created_at, updated_at, last_used, 
+                          last_verified, verification_status, metadata 
+                   FROM api_keys 
+                   WHERE email = ? AND platform = ? AND is_active = 1""",
+                (email, platform)
+            )
+        else:
+            result = db.read_sql_query(
+                """SELECT uuid, platform, created_at, updated_at, last_used, 
+                          last_verified, verification_status, metadata
+                   FROM api_keys 
+                   WHERE email = ? AND is_active = 1""",
+                (email,)
+            )
+            
+        key_info = []
+        for _, row in result.iterrows():
+            platform_name = row["platform"]
+            
+            info = {
+                "id": row["uuid"],
+                "platform": platform_name,
+                "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
+                "last_used": row["last_used"],
+                "last_verified": row["last_verified"],
+                "verification_status": row["verification_status"],
+                "has_passphrase": False,  # Will be updated below
+            }
+            
+            # Check if this platform has a passphrase
+            passphrase_result = db.read_sql_query(
+                """SELECT passphrase 
+                   FROM api_keys 
+                   WHERE email = ? AND platform = ? AND is_active = 1""",
+                (email, platform_name)
+            )
+            if not passphrase_result.empty and passphrase_result.iloc[0]['passphrase']:
+                info["has_passphrase"] = True
+                
+            # Add any additional metadata
+            if row["metadata"]:
+                try:
+                    meta_dict = json.loads(row["metadata"])
+                    # Remove sensitive data from metadata
+                    if 'ip_address' in meta_dict:
+                        meta_dict['ip_address'] = meta_dict['ip_address'].split('.')
+                        meta_dict['ip_address'][-1] = 'xxx'
+                        meta_dict['ip_address'] = '.'.join(meta_dict['ip_address'])
+                    
+                    info["metadata"] = meta_dict
+                except json.JSONDecodeError:
+                    pass
+            
+            # Get recent activity
+            activity_result = db.read_sql_query(
+                """SELECT TOP 5 action, timestamp, status
+                   FROM api_key_audit_log
+                   WHERE api_key_id = ?
+                   ORDER BY timestamp DESC""",
+                (row["uuid"],)
+            )
+            
+            if not activity_result.empty:
+                recent_activity = activity_result.to_dict('records')
+                info["recent_activity"] = recent_activity
+                
+            key_info.append(info)
+            
+        # Log access to this information
+        log_api_key_action(
+            db,
+            email=email,
+            platform=platform or "all",
+            action="info",
+            status="success"
+        )
+            
+        return key_info
+    except Exception as e:
+        logger.error(f"Error getting API key info for {email}: {str(e)}")
+        
+        # Log error
+        log_api_key_action(
+            db,
+            email=email,
+            platform=platform or "all",
+            action="info",
+            status="error",
+            details=str(e)
+        )
+        
+        return []
+
+
+def check_api_keys_exist(db, email, platform):
+    """
+    Check if a user has API keys for a specific platform
+    
+    Args:
+        db: MSSQLDatabase instance
+        email: User's email
+        platform: Trading platform name
+    
+    Returns:
+        bool: True if keys exist, False otherwise
+    """
+    try:
+        result = db.read_sql_query(
+            """SELECT COUNT(*) as count
+               FROM api_keys 
+               WHERE email = ? AND platform = ? AND is_active = 1""",
+            (email, platform)
+        )
+        count = result.iloc[0]['count']
+        
+        return count > 0
+    except Exception as e:
+        logger.error(f"Error checking API keys for {email} on {platform}: {str(e)}")
+        return False
+
+
+def migrate_existing_keys(db):
+    """
+    Migrate existing keys to the new format with UUID and verification
+    
+    Args:
+        db: MSSQLDatabase instance
+    """
+    try:
+        # Check if any keys need migration (missing UUID)
+        result = db.read_sql_query("SELECT COUNT(*) as count FROM api_keys WHERE uuid IS NULL")
+        count = result.iloc[0]['count']
+        
+        if count == 0:
+            logger.info("No API keys need migration")
+            return
+            
+        logger.info(f"Found {count} API keys to migrate")
+        
+        # Get all keys needing migration
+        keys_to_migrate = db.read_sql_query(
+            """SELECT id, email, platform, api_key, api_secret 
+               FROM api_keys 
+               WHERE uuid IS NULL"""
+        )
+        
+        for _, key in keys_to_migrate.iterrows():
+            # Generate UUID
+            key_uuid = str(uuid.uuid4())
+            
+            # Generate key hash
+            # We can't calculate the actual key hash since we can't decrypt
+            # Just use a placeholder
+            key_hash = hashlib.sha256(f"{key['id']}:{key['platform']}".encode()).hexdigest()
+            
+            # Update the key
+            db.execute_sql(
+                """UPDATE api_keys
+                   SET uuid = ?, key_hash = ?, verification_status = ?
+                   WHERE id = ?""",
+                (key_uuid, key_hash, "needs_verification", key['id'])
+            )
+            
+            logger.info(f"Migrated API key {key['id']} for {key['email']} on {key['platform']}")
+        
+        logger.info(f"Successfully migrated {len(keys_to_migrate)} API keys")
+    except Exception as e:
+        logger.error(f"Error migrating API keys: {str(e)}")
+
+
+def get_verification_needed_keys(db):
+    """
+    Get a list of API keys that need verification
+    
+    Args:
+        db: MSSQLDatabase instance
+    
+    Returns:
+        list: List of keys needing verification
+    """
+    try:
+        # Get keys that have never been verified or haven't been verified in 7 days
+        seven_days_ago = (datetime.datetime.now() - datetime.timedelta(days=7)).isoformat()
+        
+        result = db.read_sql_query(
+            """SELECT email, platform, uuid
+               FROM api_keys
+               WHERE is_active = 1 AND (
+                   last_verified IS NULL OR
+                   last_verified < ? OR
+                   verification_status = 'needs_verification'
+               )""",
+            (seven_days_ago,)
+        )
+        
+        return result.to_dict('records')
+    except Exception as e:
+        logger.error(f"Error getting keys needing verification: {str(e)}")
+        return []
+    
+
+#
+#   DB USER FUNCTIONS
+#   ---------------------
+#   These functions are used to manage user accounts in the database.
+#   They include creating, updating, and deleting user accounts.
+#   The functions also include error handling and logging for better debugging.
+
+def get_users():
+    """Get all users and their passwords from the database."""
+    db = MSSQLDatabase('users')
+    try:
+        query = "SELECT email, password FROM users;"
+        users = db.read_sql_query(query)
+        users_dict = dict(zip(users['email'], users['password']))
+    except Exception as e:
+        # Handle case where table might not exist
+        if "Invalid object name" in str(e):
+            users_dict = {}  # No users yet
+        else:
+            raise  # Reraise other errors
+    return users_dict
+
+def activate_2fa(email, totp_secret):
+    """Activate 2FA for user."""
+    db = MSSQLDatabase('users')
+    try:
+        # Create 2FA table if it doesn't exist
+        db.execute_sql(
+            """IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'totp_secrets')
+            CREATE TABLE totp_secrets (
+                email NVARCHAR(255) PRIMARY KEY,
+                secret NVARCHAR(255),
+                activated_at NVARCHAR(50)
+            )"""
+        )
+        
+        # Insert or update 2FA secret
+        db.execute_sql(
+            """MERGE INTO totp_secrets AS target
+               USING (SELECT ? AS email) AS source
+               ON target.email = source.email
+               WHEN MATCHED THEN
+                   UPDATE SET secret = ?, activated_at = ?
+               WHEN NOT MATCHED THEN
+                   INSERT (email, secret, activated_at)
+                   VALUES (?, ?, ?);""",
+            (email, totp_secret, datetime.now().isoformat(), email, totp_secret, datetime.now().isoformat())
+        )
+        
+        # Update user 2FA status
+        db.execute_sql(
+            """UPDATE users SET twofa_enabled = 1 WHERE email = ?""",
+            (email,)
+        )
+        
+        # Delete the temporary secret
+        db.execute_sql(
+            """DELETE FROM totp_setup WHERE email = ?""",
+            (email,)
+        )
+        
+        logger.info(f"2FA activated for {email}")
+    except Exception as e:
+        logger.error(f"Error activating 2FA for {email}: {str(e)}")
+        raise
+
+def save_user(email, password, privacy_policy_accepted=False, api_key=None, 
+              risk_percent=0.02, max_drawdown=0.15, max_open_trades=3):
+    """Save a new user with default risk settings and setup state."""
+    db = MSSQLDatabase('users')
+    try:
+        # Create users table if not exists
+        db.execute_sql(
+            """IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'users')
+            CREATE TABLE users (
+                email NVARCHAR(255) PRIMARY KEY,
+                password NVARCHAR(255),
+                privacy_policy_accepted BIT,
+                api_key NVARCHAR(255),
+                risk_percent NVARCHAR(50),
+                max_drawdown NVARCHAR(50),
+                max_open_trades NVARCHAR(50),
+                platform_connected BIT,
+                email_verified BIT,
+                twofa_enabled BIT,
+                setup_complete BIT,
+                setup_completion_time NVARCHAR(50),
+                created_at NVARCHAR(50)
+            )"""
+        )
+        
+        current_time = datetime.now().isoformat()
+        
+        # Insert new user
+        db.execute_sql(
+            """INSERT INTO users 
+               (email, password, privacy_policy_accepted, api_key, 
+                risk_percent, max_drawdown, max_open_trades,
+                platform_connected, email_verified, twofa_enabled, setup_complete,
+                setup_completion_time, created_at) 
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""", 
+            (email, password, 1 if privacy_policy_accepted else 0, api_key, 
+             str(risk_percent), str(max_drawdown), str(max_open_trades),
+             0, 0, 0, 0, None, current_time)
+        )
+        
+        logger.info(f"User {email} registered with default risk settings")
+    except Exception as e:
+        logger.error(f"Error saving user {email}: {str(e)}")
+        raise
+
+def save_user_platform(email, platform, timestamp):
+    """Save user platform connection information."""
+    db = MSSQLDatabase('users')
+    try:
+        # Create platform connections table if it doesn't exist
+        db.execute_sql(
+            """IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'platform_connections')
+            CREATE TABLE platform_connections (
+                email NVARCHAR(255) PRIMARY KEY,
+                platform NVARCHAR(50),
+                timestamp NVARCHAR(50),
+                api_key NVARCHAR(255),
+                api_secret NVARCHAR(255)
+            )"""
+        )
+        
+        # Check if a platform connection exists
+        result = db.read_sql_query(
+            "SELECT email FROM platform_connections WHERE email = ?", 
+            (email,)
+        )
+        
+        if not result.empty:
+            # Update existing platform record
+            db.execute_sql(
+                """UPDATE platform_connections 
+                   SET platform = ?, timestamp = ? 
+                   WHERE email = ?""", 
+                (platform, timestamp, email)
+            )
+        else:
+            # Insert new platform record
+            db.execute_sql(
+                """INSERT INTO platform_connections (email, platform, timestamp)
+                   VALUES (?, ?, ?)""",
+                (email, platform, timestamp)
+            )
+        
+        # Update user setup status
+        db.execute_sql(
+            """UPDATE users 
+               SET platform_connected = 1 
+               WHERE email = ?""",
+            (email,)
+        )
+        
+        logger.info(f"User {email} connected to platform {platform}")
+    except Exception as e:
+        logger.error(f"Error saving platform for {email}: {str(e)}")
+        raise
+
+def save_verification_code(email, verification_code, expires_at):
+    """Save email verification code."""
+    db = MSSQLDatabase('users')
+    try:
+        # Create verification codes table if it doesn't exist
+        db.execute_sql(
+            """IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'verification_codes')
+            CREATE TABLE verification_codes (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                email NVARCHAR(255),
+                code NVARCHAR(50),
+                expires_at NVARCHAR(50),
+                created_at NVARCHAR(50),
+                used BIT DEFAULT 0
+            )"""
+        )
+        
+        # Insert new verification code
+        db.execute_sql(
+            """INSERT INTO verification_codes (email, code, expires_at, created_at)
+               VALUES (?, ?, ?, ?)""",
+            (email, verification_code, expires_at.isoformat(), datetime.now().isoformat())
+        )
+        
+        logger.info(f"Verification code created for {email}")
+    except Exception as e:
+        logger.error(f"Error saving verification code for {email}: {str(e)}")
+        raise
+
+def get_recent_verification_attempts(email, minutes=60):
+    """Get count of recent verification attempts for rate limiting."""
+    db = MSSQLDatabase('users')
+    try:
+        # Check if table exists
+        result = db.read_sql_query(
+            """SELECT COUNT(*) AS table_count FROM INFORMATION_SCHEMA.TABLES 
+               WHERE TABLE_NAME = 'verification_codes'"""
+        )
+        
+        if result.iloc[0]['table_count'] == 0:
+            return 0
+            
+        # Get verification attempts in the last X minutes
+        time_threshold = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+        
+        result = db.read_sql_query(
+            """SELECT COUNT(*) AS attempt_count FROM verification_codes
+               WHERE email = ? AND created_at > ?""",
+            (email, time_threshold)
+        )
+        
+        return result.iloc[0]['attempt_count']
+    except Exception as e:
+        logger.error(f"Error getting verification attempts for {email}: {str(e)}")
+        return 0  # Return 0 on error to avoid blocking legitimate users
+
+def check_verification_code(email, verification_code):
+    """Check if verification code is valid and not expired."""
+    db = MSSQLDatabase('users')
+    try:
+        # Check if table exists
+        result = db.read_sql_query(
+            """SELECT COUNT(*) AS table_count FROM INFORMATION_SCHEMA.TABLES 
+               WHERE TABLE_NAME = 'verification_codes'"""
+        )
+        
+        if result.iloc[0]['table_count'] == 0:
+            return {
+                "valid": False,
+                "message": "No verification code found. Please request a new code."
+            }
+        
+        # Get the most recent verification code for this email
+        result = db.read_sql_query(
+            """SELECT TOP 1 code, expires_at, used FROM verification_codes
+               WHERE email = ? ORDER BY created_at DESC""",
+            (email,)
+        )
+        
+        if result.empty:
+            return {
+                "valid": False,
+                "message": "No verification code found. Please request a new code."
+            }
+        
+        db_code = result.iloc[0]['code']
+        expires_at_str = result.iloc[0]['expires_at']
+        used = result.iloc[0]['used']
+        
+        # Check if code is used
+        if used:
+            return {
+                "valid": False,
+                "message": "Verification code already used. Please request a new code."
+            }
+        
+        # Check if code is expired
+        expires_at = datetime.fromisoformat(expires_at_str)
+        if expires_at < datetime.now():
+            return {
+                "valid": False,
+                "message": "Verification code expired. Please request a new code."
+            }
+        
+        # Check if code matches
+        if verification_code != db_code:
+            return {
+                "valid": False,
+                "message": "Invalid verification code. Please try again."
+            }
+        
+        # Mark code as used
+        db.execute_sql(
+            """UPDATE verification_codes SET used = 1 WHERE email = ? AND code = ?""",
+            (email, verification_code)
+        )
+        
+        return {
+            "valid": True,
+            "message": "Verification successful."
+        }
+    except Exception as e:
+        logger.error(f"Error checking verification code for {email}: {str(e)}")
+        return {
+            "valid": False,
+            "message": "An error occurred while verifying the code."
+        }
+
+def log_failed_verification(email, verification_code):
+    """Log failed verification attempt for security monitoring."""
+    db = MSSQLDatabase('users')
+    try:
+        # Create failed verifications table if it doesn't exist
+        db.execute_sql(
+            """IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'failed_verifications')
+            CREATE TABLE failed_verifications (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                email NVARCHAR(255),
+                code NVARCHAR(50),
+                attempt_time NVARCHAR(50),
+                ip_address NVARCHAR(50)
+            )"""
+        )
+        
+        # Insert failed verification record
+        db.execute_sql(
+            """INSERT INTO failed_verifications (email, code, attempt_time)
+               VALUES (?, ?, ?)""",
+            (email, verification_code, datetime.now().isoformat())
+        )
+        
+        logger.warning(f"Failed verification attempt for {email}")
+    except Exception as e:
+        logger.error(f"Error logging failed verification for {email}: {str(e)}")
+
+def count_recent_failed_verifications(email, minutes=30):
+    """Count recent failed verification attempts."""
+    db = MSSQLDatabase('users')
+    try:
+        # Check if table exists
+        result = db.read_sql_query(
+            """SELECT COUNT(*) AS table_count FROM INFORMATION_SCHEMA.TABLES 
+               WHERE TABLE_NAME = 'failed_verifications'"""
+        )
+        
+        if result.iloc[0]['table_count'] == 0:
+            return 0
+            
+        # Get failed verification attempts in the last X minutes
+        time_threshold = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+        
+        result = db.read_sql_query(
+            """SELECT COUNT(*) AS failed_count FROM failed_verifications
+               WHERE email = ? AND attempt_time > ?""",
+            (email, time_threshold)
+        )
+        
+        return result.iloc[0]['failed_count']
+    except Exception as e:
+        logger.error(f"Error counting failed verifications for {email}: {str(e)}")
+        return 0
+
+def mark_email_verified(email):
+    """Mark user's email as verified."""
+    db = MSSQLDatabase('users')
+    try:
+        # Update user email verification status
+        db.execute_sql(
+            """UPDATE users SET email_verified = 1 WHERE email = ?""",
+            (email,)
+        )
+        
+        logger.info(f"Email verified for user {email}")
+    except Exception as e:
+        logger.error(f"Error marking email as verified for {email}: {str(e)}")
+        raise
+
+def save_temp_2fa_secret(email, totp_secret):
+    """Save temporary 2FA secret during setup."""
+    db = MSSQLDatabase('users')
+    try:
+        # Create 2FA setup table if it doesn't exist
+        db.execute_sql(
+            """IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'totp_setup')
+            CREATE TABLE totp_setup (
+                email NVARCHAR(255) PRIMARY KEY,
+                secret NVARCHAR(255),
+                created_at NVARCHAR(50)
+            )"""
+        )
+        
+        # Check if there's an existing entry
+        result = db.read_sql_query(
+            """SELECT email FROM totp_setup WHERE email = ?""",
+            (email,)
+        )
+        
+        if not result.empty:
+            # Update existing entry
+            db.execute_sql(
+                """UPDATE totp_setup 
+                   SET secret = ?, created_at = ? 
+                   WHERE email = ?""",
+                (totp_secret, datetime.now().isoformat(), email)
+            )
+        else:
+            # Insert new entry
+            db.execute_sql(
+                """INSERT INTO totp_setup (email, secret, created_at)
+                   VALUES (?, ?, ?)""",
+                (email, totp_secret, datetime.now().isoformat())
+            )
+        
+        logger.info(f"Temporary 2FA secret saved for {email}")
+    except Exception as e:
+        logger.error(f"Error saving temporary 2FA secret for {email}: {str(e)}")
+        raise
+
+def get_temp_2fa_secret(email):
+    """Get temporary 2FA secret."""
+    db = MSSQLDatabase('users')
+    try:
+        # Get the 2FA secret
+        result = db.read_sql_query(
+            """SELECT secret FROM totp_setup WHERE email = ?""",
+            (email,)
+        )
+        
+        if not result.empty:
+            return result.iloc[0]['secret']
+        else:
+            return None
+    except Exception as e:
+        logger.error(f"Error getting temporary 2FA secret for {email}: {str(e)}")
+        return None
+
+def log_failed_2fa_attempt(email):
+    """Log failed 2FA verification attempt."""
+    db = MSSQLDatabase('users')
+    try:
+        # Create failed 2FA attempts table if it doesn't exist
+        db.execute_sql(
+            """IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'failed_2fa_attempts')
+            CREATE TABLE failed_2fa_attempts (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                email NVARCHAR(255),
+                attempt_time NVARCHAR(50),
+                ip_address NVARCHAR(50)
+            )"""
+        )
+        
+        # Insert failed attempt record
+        db.execute_sql(
+            """INSERT INTO failed_2fa_attempts (email, attempt_time)
+               VALUES (?, ?)""",
+            (email, datetime.now().isoformat())
+        )
+        
+        logger.warning(f"Failed 2FA attempt for {email}")
+    except Exception as e:
+        logger.error(f"Error logging failed 2FA attempt for {email}: {str(e)}")
+
+def count_recent_failed_2fa_attempts(email, minutes=30):
+    """Count recent failed 2FA attempts."""
+    db = MSSQLDatabase('users')
+    try:
+        # Check if table exists
+        result = db.read_sql_query(
+            """SELECT COUNT(*) AS table_count FROM INFORMATION_SCHEMA.TABLES 
+               WHERE TABLE_NAME = 'failed_2fa_attempts'"""
+        )
+        
+        if result.iloc[0]['table_count'] == 0:
+            return 0
+            
+        # Get failed 2FA attempts in the last X minutes
+        time_threshold = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+        
+        result = db.read_sql_query(
+            """SELECT COUNT(*) AS failed_count FROM failed_2fa_attempts
+               WHERE email = ? AND attempt_time > ?""",
+            (email, time_threshold)
+        )
+        
+        return result.iloc[0]['failed_count']
+    except Exception as e:
+        logger.error(f"Error counting failed 2FA attempts for {email}: {str(e)}")
+        return 0
+
+def save_backup_codes(email, backup_codes):
+    """Save backup codes for 2FA recovery."""
+    db = MSSQLDatabase('users')
+    try:
+        # Create backup codes table if it doesn't exist
+        db.execute_sql(
+            """IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'backup_codes')
+            CREATE TABLE backup_codes (
+                email NVARCHAR(255) PRIMARY KEY,
+                codes NVARCHAR(MAX),
+                created_at NVARCHAR(50)
+            )"""
+        )
+        
+        # Convert codes list to JSON string
+        codes_json = json.dumps(backup_codes)
+        
+        # Insert or update backup codes
+        db.execute_sql(
+            """MERGE INTO backup_codes AS target
+               USING (SELECT ? AS email) AS source
+               ON target.email = source.email
+               WHEN MATCHED THEN
+                   UPDATE SET codes = ?, created_at = ?
+               WHEN NOT MATCHED THEN
+                   INSERT (email, codes, created_at)
+                   VALUES (?, ?, ?);""",
+            (email, codes_json, datetime.now().isoformat(), email, codes_json, datetime.now().isoformat())
+        )
+        
+        logger.info(f"Backup codes saved for {email}")
+    except Exception as e:
+        logger.error(f"Error saving backup codes for {email}: {str(e)}")
+        raise
+
+def get_user_setup_status(email):
+    """Get user's setup status."""
+    db = MSSQLDatabase('users')
+    try:
+        # Get user setup status
+        result = db.read_sql_query(
+            """SELECT platform_connected, email_verified, twofa_enabled, setup_complete
+               FROM users WHERE email = ?""",
+            (email,)
+        )
+        
+        if result.empty:
+            return {
+                "platform_connected": False,
+                "email_verified": False,
+                "2fa_enabled": False,
+                "setup_complete": False
+            }
+        
+        # Convert bit/boolean values to Python booleans
+        platform_connected = bool(result.iloc[0]['platform_connected'])
+        email_verified = bool(result.iloc[0]['email_verified'])
+        twofa_enabled = bool(result.iloc[0]['twofa_enabled'])
+        setup_complete = bool(result.iloc[0]['setup_complete'])
+        
+        return {
+            "platform_connected": platform_connected,
+            "email_verified": email_verified,
+            "2fa_enabled": twofa_enabled,
+            "setup_complete": setup_complete
+        }
+    except Exception as e:
+        logger.error(f"Error getting setup status for {email}: {str(e)}")
+        return {
+            "platform_connected": False,
+            "email_verified": False,
+            "2fa_enabled": False,
+            "setup_complete": False
+        }
+
+def mark_setup_complete(email, completion_time):
+    """Mark user setup as complete."""
+    db = MSSQLDatabase('users')
+    try:
+        # Update user setup status
+        db.execute_sql(
+            """UPDATE users 
+               SET setup_complete = 1, setup_completion_time = ? 
+               WHERE email = ?""",
+            (completion_time.isoformat(), email)
+        )
+        
+        logger.info(f"Setup marked complete for {email}")
+    except Exception as e:
+        logger.error(f"Error marking setup complete for {email}: {str(e)}")
+        raise
+
+def get_risk_settings(email):
+    """Get user's risk settings."""
+    db = MSSQLDatabase('users')
+    try:
+        # Check if the table has risk columns
+        columns_result = db.read_sql_query(
+            """SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+               WHERE TABLE_NAME = 'users'"""
+        )
+        columns = columns_result['COLUMN_NAME'].tolist()
+        
+        # If risk columns don't exist, add them and set defaults
+        missing_columns = []
+        for col in ['risk_percent', 'max_drawdown', 'max_open_trades']:
+            if col not in columns:
+                missing_columns.append(col)
+        
+        if missing_columns:
+            for col in missing_columns:
+                db.execute_sql(f"ALTER TABLE users ADD {col} NVARCHAR(50)")
+                
+            # Set default values for the new columns
+            db.execute_sql(
+                """UPDATE users SET risk_percent = ?, max_drawdown = ?, max_open_trades = ? 
+                   WHERE email = ?""",
+                ('0.02', '0.15', '3', email)
+            )
+        
+        # Query the risk settings
+        result = db.read_sql_query(
+            """SELECT risk_percent, max_drawdown, max_open_trades 
+               FROM users WHERE email = ?""", 
+            (email,)
+        )
+        
+        if result.empty:
+            return None
+            
+        # Convert from strings to appropriate types
+        risk_percent = float(result.iloc[0]['risk_percent'] or 0.02)
+        max_drawdown = float(result.iloc[0]['max_drawdown'] or 0.15)
+        max_open_trades = int(result.iloc[0]['max_open_trades'] or 3)
+        
+        return {
+            "risk_percent": risk_percent,
+            "max_drawdown": max_drawdown,
+            "max_open_trades": max_open_trades
+        }
+    except Exception as e:
+        logger.error(f"Error getting risk settings for {email}: {str(e)}")
+        return None
+
+def update_risk_settings(email, risk_percent, max_drawdown, max_open_trades):
+    """Update user's risk settings."""
+    db = MSSQLDatabase('users')
+    try:
+        # Check if the table has risk columns
+        columns_result = db.read_sql_query(
+            """SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+               WHERE TABLE_NAME = 'users'"""
+        )
+        columns = columns_result['COLUMN_NAME'].tolist()
+        
+        # If risk columns don't exist, add them
+        missing_columns = []
+        for col in ['risk_percent', 'max_drawdown', 'max_open_trades']:
+            if col not in columns:
+                missing_columns.append(col)
+        
+        if missing_columns:
+            for col in missing_columns:
+                db.execute_sql(f"ALTER TABLE users ADD {col} NVARCHAR(50)")
+        
+        # Update the risk settings
+        result = db.execute_sql(
+            """UPDATE users 
+               SET risk_percent = ?, max_drawdown = ?, max_open_trades = ? 
+               WHERE email = ?""",
+            (str(risk_percent), str(max_drawdown), str(max_open_trades), email)
+        )
+        
+        # Check if the update was successful (rowcount property might not be directly accessible)
+        check_result = db.read_sql_query(
+            "SELECT COUNT(*) AS row_count FROM users WHERE email = ?", 
+            (email,)
+        )
+        
+        if check_result.iloc[0]['row_count'] > 0:
+            logger.info(f"Updated risk settings for user {email}")
+            return True
+        else:
+            logger.warning(f"No user found with email {email} for risk settings update")
+            return False
+    except Exception as e:
+        logger.error(f"Error updating risk settings for {email}: {str(e)}")
+        return False
+
+def get_backtest_history(email):
+    """Get user's backtest history."""
+    db = MSSQLDatabase('users')
+    try:
+        # Check if table exists
+        result = db.read_sql_query(
+            """SELECT COUNT(*) AS table_count FROM INFORMATION_SCHEMA.TABLES 
+               WHERE TABLE_NAME = 'backtests'"""
+        )
+        
+        if result.iloc[0]['table_count'] == 0:
+            # Create backtests table if it doesn't exist
+            db.execute_sql(
+                """CREATE TABLE backtests (
+                    id INT IDENTITY(1,1) PRIMARY KEY,
+                    email NVARCHAR(255),
+                    symbol NVARCHAR(50),
+                    strategy NVARCHAR(50),
+                    result NVARCHAR(MAX),
+                    date NVARCHAR(50)
+                )"""
+            )
+            return []
+        
+        # Get backtest history
+        history = db.read_sql_query(
+            "SELECT * FROM backtests WHERE email = ?",
+            (email,)
+        )
+        
+        return history.to_dict(orient="records")
+    except Exception as e:
+        logger.error(f"Error getting backtest history for {email}: {str(e)}")
+        return []
+
+def save_password_reset_token(email, reset_token, expires_at):
+    """Save a password reset token for a user."""
+    db = MSSQLDatabase('users')
+    try:
+        # Create password reset tokens table if it doesn't exist
+        db.execute_sql(
+            """IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'password_reset_tokens')
+            CREATE TABLE password_reset_tokens (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                email NVARCHAR(255),
+                token NVARCHAR(255),
+                expires_at NVARCHAR(50),
+                created_at NVARCHAR(50),
+                used BIT DEFAULT 0
+            )"""
+        )
+        
+        # Insert the new token
+        db.execute_sql(
+            """INSERT INTO password_reset_tokens (email, token, expires_at, created_at, used)
+               VALUES (?, ?, ?, ?, ?)""",
+            (email, reset_token, expires_at.isoformat(), datetime.now().isoformat(), 0)
+        )
+        
+        logger.info(f"Password reset token created for {email}")
+    except Exception as e:
+        logger.error(f"Error saving password reset token for {email}: {str(e)}")
+        raise
+
+def get_recent_password_reset_requests(email, minutes=60):
+    """Count recent password reset requests for rate limiting."""
+    db = MSSQLDatabase('users')
+    try:
+        # Check if table exists
+        result = db.read_sql_query(
+            """SELECT COUNT(*) AS table_count FROM INFORMATION_SCHEMA.TABLES 
+               WHERE TABLE_NAME = 'password_reset_tokens'"""
+        )
+        
+        if result.iloc[0]['table_count'] == 0:
+            return 0
+        
+        # Calculate the cutoff time
+        cutoff_time = (datetime.now() - timedelta(minutes=minutes)).isoformat()
+        
+        # Count recent requests
+        result = db.read_sql_query(
+            """SELECT COUNT(*) AS request_count FROM password_reset_tokens 
+               WHERE email = ? AND created_at > ?""",
+            (email, cutoff_time)
+        )
+        
+        return result.iloc[0]['request_count']
+    except Exception as e:
+        logger.error(f"Error counting recent password reset requests for {email}: {str(e)}")
+        return 0
+
+def validate_password_reset_token(email, token):
+    """Validate if a password reset token is valid and not expired."""
+    db = MSSQLDatabase('users')
+    try:
+        # Check if table exists
+        result = db.read_sql_query(
+            """SELECT COUNT(*) AS table_count FROM INFORMATION_SCHEMA.TABLES 
+               WHERE TABLE_NAME = 'password_reset_tokens'"""
+        )
+        
+        if result.iloc[0]['table_count'] == 0:
+            return False
+        
+        # Get the token
+        result = db.read_sql_query(
+            """SELECT TOP 1 expires_at, used FROM password_reset_tokens 
+               WHERE email = ? AND token = ?
+               ORDER BY created_at DESC""",
+            (email, token)
+        )
+        
+        # Token not found
+        if result.empty:
+            return False
+        
+        expires_at = result.iloc[0]['expires_at']
+        used = result.iloc[0]['used']
+        
+        # Check if token is used
+        if used:
+            return False
+        
+        # Check if token is expired
+        expires_at_dt = datetime.fromisoformat(expires_at)
+        if datetime.now() > expires_at_dt:
+            return False
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error validating password reset token for {email}: {str(e)}")
+        return False
+
+def invalidate_password_reset_token(email, token):
+    """Mark a password reset token as used to prevent reuse."""
+    db = MSSQLDatabase('users')
+    try:
+        # Mark the token as used
+        db.execute_sql(
+            """UPDATE password_reset_tokens SET used = 1
+               WHERE email = ? AND token = ?""",
+            (email, token)
+        )
+        
+        logger.info(f"Password reset token invalidated for {email}")
+    except Exception as e:
+        logger.error(f"Error invalidating password reset token for {email}: {str(e)}")
+
+def log_failed_password_reset(email, token):
+    """Log failed password reset attempt for security monitoring."""
+
+    db = MSSQLDatabase('users')
+
+    try:
+        # Create failed attempts table if it doesn't exist
+        db.execute_sql(
+            """IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'failed_password_resets')
+            CREATE TABLE failed_password_resets (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                email NVARCHAR(255),
+                token NVARCHAR(255),
+                attempt_time NVARCHAR(50),
+                ip_address NVARCHAR(50)
+            )"""
+        )
+        
+        # Log the failed attempt
+        db.execute_sql(
+            """INSERT INTO failed_password_resets (email, token, attempt_time, ip_address)
+               VALUES (?, ?, ?, ?)""",
+            (email, token, datetime.now().isoformat(), "N/A")
+        )
+        
+        logger.warning(f"Failed password reset attempt logged for {email}")
+    except Exception as e:
+        logger.error(f"Error logging failed password reset for {email}: {str(e)}")
+
+def update_user_password(email, hashed_password):
+    """Update a user's password."""
+    
+    db = MSSQLDatabase('users')
+
+    try:
+        # Update the password
+        db.execute_sql(
+            """UPDATE users SET password = ? WHERE email = ?""",
+            (hashed_password, email)
+        )
+        
+        # Check if update was successful
+        result = db.read_sql_query(
+            "SELECT COUNT(*) AS row_count FROM users WHERE email = ?",
+            (email,)
+        )
+        
+        if result.iloc[0]['row_count'] == 0:
+            logger.error(f"User {email} not found when trying to update password")
+            raise Exception(f"User {email} not found")
+        
+        # Log the password change
+        db.execute_sql(
+            """IF NOT EXISTS (SELECT * FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_NAME = 'password_changes')
+            CREATE TABLE password_changes (
+                id INT IDENTITY(1,1) PRIMARY KEY,
+                email NVARCHAR(255),
+                changed_at NVARCHAR(50)
+            )"""
+        )
+        
+        db.execute_sql(
+            """INSERT INTO password_changes (email, changed_at)
+               VALUES (?, ?)""",
+            (email, datetime.now().isoformat())
+        )
+        
+        logger.info(f"Password updated for {email}")
+    except Exception as e:
+        logger.error(f"Error updating password for {email}: {str(e)}")
+        raise
+
+def invalidate_password_reset_token(email, token):
+    """
+    Mark a password reset token as used to prevent reuse
+    
+    Args:
+        email: User email
+        token: Token to invalidate
+    """
+    try:
+        # Create database connection using the MSSQLDatabase class
+        db = MSSQLDatabase('users')
+        
+        # SQL query to mark the token as used
+        sql_query = """
+            UPDATE password_reset_tokens 
+            SET used = 1
+            WHERE email = :email AND token = :token
+        """
+        
+        # Execute the update query with parameters
+        params = {"email": email, "token": token}
+        db.execute_sql(sql_query, params)
+        
+        logger.info(f"Password reset token invalidated for {email}")
+    except Exception as e:
+        logger.error(f"Error invalidating password reset token for {email}: {str(e)}")
+    finally:
+        # No need to explicitly close connection as it's handled by the context manager in execute_sql
+        pass

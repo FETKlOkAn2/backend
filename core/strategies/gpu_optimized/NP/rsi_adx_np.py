@@ -1,7 +1,7 @@
 from core.strategies.strategy import Strategy
 import numpy as np
 import pandas as pd
-import core.utils as utils
+import backend.core.utils.utils as utils
 
 class RSI_ADX_NP(Strategy):
     def __init__(self, dict_df, risk_object=None, with_sizing=True, hyper=None):

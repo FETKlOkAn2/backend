@@ -1,7 +1,7 @@
 from core.strategies.strategy import Strategy
 import numpy as np
 import pandas as pd
-import core.utils as utils
+import backend.core.utils.utils as utils
 import talib as ta
 
 class MACD_ATR(Strategy):

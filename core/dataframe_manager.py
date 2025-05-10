@@ -1,6 +1,6 @@
 import pandas as pd
 import datetime as dt
-import core.utils as utils
+import backend.core.utils.utils as utils
 
 
 class DF_Manager():

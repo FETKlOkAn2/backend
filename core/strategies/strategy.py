@@ -7,7 +7,7 @@ import sys
 import talib as ta
 import cupy as cp
 from numba import njit
-import core.utils as utils
+import backend.core.utils.utils as utils
 # import logging 
 # logging.basicConfig(level=logging.DEBUG)
 

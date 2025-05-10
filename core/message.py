@@ -8,7 +8,7 @@ import gc
 from core.strategies.strategy import Strategy
 from core.risk import Risk_Handler
 import core.database_interaction
-import utils
+import backend.core.utils.utils as utils
 
 # Define global functions
 

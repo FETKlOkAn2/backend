@@ -2,7 +2,7 @@ from core.strategies.strategy import Strategy
 import cupy as cp
 import numpy as np
 import pandas as pd
-import core.utils as utils
+import backend.core.utils.utils as utils
 
 
 class BollingerBands_VWAP_GPU(Strategy):
