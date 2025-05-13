@@ -1,5 +1,5 @@
 import pandas as pd
-import backend.core.utils.utils as utils
+import core.utils.utils as utils
 import inspect
 import numpy as np
 import sys
