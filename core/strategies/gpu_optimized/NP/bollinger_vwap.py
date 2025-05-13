@@ -1,6 +1,6 @@
 from core.strategies.strategy import Strategy
 import numpy as np
-import backend.core.utils.utils as utils
+import core.utils.utils as utils
 
 
 class BollingerBands_VWAP(Strategy):
