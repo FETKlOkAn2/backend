@@ -1,11 +1,12 @@
 from gevent import monkey
 monkey.patch_all()
 
+import ssl
+import click
+import logging
 from flask import Flask, request
 from flask_cors import CORS
 from flask_socketio import SocketIO
-import logging
-import click
 
 from core.webapp.config import Config
 from core.webapp.api.auth import auth_bp
@@ -86,14 +87,14 @@ register_socket_handlers(socketio)
 @click.command()
 @click.option('--certfile', default=None, help='Path to SSL certificate file')
 @click.option('--keyfile', default=None, help='Path to SSL key file')
-
-
-
 def main(certfile, keyfile):
     """
     Entry point for running the Flask-SocketIO app with optional SSL.
     """
-    ssl_ctx = (certfile, keyfile) if certfile and keyfile else None
+    ssl_ctx = None
+    if certfile and keyfile:
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(certfile, keyfile)
     socketio.run(app, host='0.0.0.0', port=5000, ssl_context=ssl_ctx)
 
 if __name__ == '__main__':
