@@ -57,6 +57,6 @@ COPY . .
 EXPOSE 5000
 
 # 6) Launch Flask with SSL context
-CMD ["python", "-u", "-m", "core.webapp.app", \
-     "--certfile=/certs/selfsigned.crt", \
-     "--keyfile=/certs/selfsigned.key"]
+ENTRYPOINT ["python","-u","-m","core.webapp.app"]
+CMD ["--certfile","/certs/selfsigned.crt","--keyfile","/certs/selfsigned.key"]
+
