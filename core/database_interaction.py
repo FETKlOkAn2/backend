@@ -1,5 +1,5 @@
 import pandas as pd
-import backend.core.utils.utils as utils
+import core.utils.utils as utils
 import inspect
 import numpy as np
 import sys
@@ -60,37 +60,51 @@ class MSSQLDatabase:
         self.password = os.getenv("DB_PASSWORD")
         self.host = os.getenv("DB_HOST")
         self.port = os.getenv("DB_PORT", "1433")
-        self.db = db_file_name # Retaining the original logic of string interpolation
+        self.db = db_file_name
         self.driver = "ODBC+Driver+18+for+SQL+Server"
-        self.engine = self.get_engine() # Initialize engine in the constructor
-        self.lock = Lock() # Thread lock for database access
+        self.engine = self.get_engine()
+        self.lock = Lock()
+        
+    def table_exists(self, schema_name, table_name):
+        """Check if a table exists in the specified schema."""
+        sql = f"SELECT CASE WHEN OBJECT_ID('[{schema_name}].[{table_name}]', 'U') IS NOT NULL THEN 1 ELSE 0 END as table_exists"
+        result = self.read_sql_query(sql)
+        return result.iloc[0]['table_exists'] == 1
 
     def get_engine(self):
+        # Fixed connection string format with properly escaped parameters
         url = (
-            f"mssql+pyodbc://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}?driver={self.driver}"
-            "&TrustServerCertificate=yes"
+            f"mssql+pyodbc://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}?"
+            f"driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes"
         )
-        return create_engine(url, pool_pre_ping=True, fast_executemany=True)
+        return create_engine(url, pool_pre_ping=True)  # Removed fast_executemany=True
 
     def execute_sql(self, sql_text, params=None):
-         with self.lock, self.engine.begin() as conn:
-             if params:
-                 return conn.execute(text(sql_text), params)
-             else:
-                 return conn.execute(text(sql_text))
+        with self.lock, self.engine.begin() as conn:
+            if params:
+                return conn.execute(text(sql_text), params)
+            else:
+                return conn.execute(text(sql_text))
+
     def read_sql_query(self, sql_text, params=None):
-        """Execute a SQL query and return the result as a pandas DataFrame."""
         with self.lock, self.engine.begin() as conn:
             if params:
                 return pd.read_sql_query(text(sql_text), conn, params=params)
             else:
                 return pd.read_sql_query(text(sql_text), conn)
 
-    def to_sql(self, df, table_name, if_exists='append', index=False):
-        """Write records stored in a DataFrame to a SQL database."""
-        with self.lock, self.engine.begin() as conn:
-            df.to_sql(table_name, conn, if_exists=if_exists, index=index, method='multi', chunksize=20000)
-            
+    def to_sql(self, df, table_name, schema=None, if_exists='append', index=False):
+        # Modified to use smaller chunk size and avoid using method='multi'
+        with self.lock:
+            df.to_sql(
+                table_name, 
+                self.engine, 
+                schema=schema,
+                if_exists=if_exists, 
+                index=index, 
+                chunksize=100  # Smaller chunk size
+            )
+
     def create_table_if_not_exists(self, table_name, df):
         """
         Creates a table if it doesn't exist based on the DataFrame's schema.
