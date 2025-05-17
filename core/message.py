@@ -8,7 +8,7 @@ import gc
 from core.strategies.strategy import Strategy
 from core.risk import Risk_Handler
 import core.database_interaction
-import backend.core.utils.utils as utils
+import core.utils.utils as utils
 
 # Define global functions
 
@@ -242,7 +242,7 @@ class TestBed():
     def __init__(self):
         risk = Risk_Handler()
 
-        dict_df = database_interaction.get_historical_from_db(
+        dict_df = core.database_interaction.get_historical_from_db(
             granularity='ONE_MINUTE',
             symbols=symbols,
             num_days=12

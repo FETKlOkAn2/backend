@@ -3,7 +3,7 @@
 
 import datetime as dt
 import pandas as pd
-import backend.core.utils.utils as utils
+import core.utils.utils as utils
 import sqlite3 as sql
 import os
 import core.database_interaction as database_interaction

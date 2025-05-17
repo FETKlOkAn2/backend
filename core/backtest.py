@@ -2,7 +2,7 @@ import sys
 import os
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import pandas as pd
-import backend.core.utils.utils as utils
+import core.utils.utils as utils
 import datetime as dt
 import numpy as np
 import core.database_interaction as database_interaction

@@ -1,7 +1,9 @@
 from gevent import monkey
 monkey.patch_all()
 
-from flask import Flask, request
+from flask import Flask, request, redirect, url_for, session
+from authlib.integrations.flask_client import OAuth
+import os
 from flask_cors import CORS
 from flask_socketio import SocketIO
 import logging
@@ -21,7 +23,17 @@ logging.basicConfig(
 def create_app(config_class=Config):
     app = Flask(__name__)
     app.config.from_object(config_class)
-    
+    app.secret_key = os.urandom(24)  # Use a secure random key in production
+    oauth = OAuth(app)
+
+    oauth.register(
+    name='oidc',
+    authority='https://cognito-idp.eu-north-1.amazonaws.com/eu-north-1_oh72FkuWi',
+    client_id='6fvcfv0kh50t2ukq800jckf0ic',
+    client_secret='<client secret>',
+    server_metadata_url='https://cognito-idp.eu-north-1.amazonaws.com/eu-north-1_oh72FkuWi/.well-known/openid-configuration',
+    client_kwargs={'scope': 'phone openid email'}
+    )
     # Enable CORS with more detailed configuration
     CORS(
         app,
