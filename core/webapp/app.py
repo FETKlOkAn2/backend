@@ -6,13 +6,18 @@ from authlib.integrations.flask_client import OAuth
 import os
 from flask_cors import CORS
 from flask_socketio import SocketIO
-import logging
 
 from core.webapp.config import Config
 from core.webapp.api.auth import auth_bp
 from core.webapp.api.backtest import backtest_bp
 from core.webapp.api.trading import trading_bp
 from core.webapp.websockets.handlers import register_socket_handlers
+
+import ssl
+import logging
+import click
+
+
 
 # Configure logging
 logging.basicConfig(
@@ -94,5 +99,18 @@ app.extensions['socketio'] = socketio
 # Register socket event handlers
 register_socket_handlers(socketio)
 
+@click.command()
+@click.option('--certfile', default=None, help='Path to SSL certificate file')
+@click.option('--keyfile', default=None, help='Path to SSL key file')
+def main(certfile, keyfile):
+    """
+    Entry point for running the Flask-SocketIO app with optional SSL.
+    """
+    ssl_ctx = None
+    if certfile and keyfile:
+        ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ssl_ctx.load_cert_chain(certfile, keyfile)
+    socketio.run(app, host='0.0.0.0', port=5000, ssl_context=ssl_ctx)
+
 if __name__ == '__main__':
-    socketio.run(app, host='0.0.0.0', port=5000)
+    main()
