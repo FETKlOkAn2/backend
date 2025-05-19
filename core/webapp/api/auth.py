@@ -1,170 +1,327 @@
-from flask import Blueprint, request, jsonify, current_app, redirect, url_for, session
-import jwt
-import datetime
-from werkzeug.security import generate_password_hash, check_password_hash
-import core.database_interaction as database_interaction
+from flask import Blueprint, request, jsonify, current_app
+import boto3
+import os
+import hmac
+import hashlib
+import base64
+from flask_cors import cross_origin
 
 auth_bp = Blueprint('auth', __name__)
 
-@auth_bp.route('/status', methods=['GET'])
-def status():
-    """Check authentication status"""
-    user = session.get('user')
-    if user:
-        return jsonify({
-            "status": "authenticated",
-            "user": user
-        })
-    else:
-        return jsonify({
-            "status": "unauthenticated"
-        }), 401
-
-@auth_bp.route('/login', methods=['GET'])
-def login_redirect():
-    """Redirect to Cognito login"""
-    oauth = current_app.extensions['oauth']
-    redirect_uri = url_for('authorize', _external=True)
-    return oauth.cognito.authorize_redirect(redirect_uri)
-
-# For API clients that need tokens
-@auth_bp.route('/token', methods=['GET'])
-def get_token():
-    """Get current session token information"""
-    user = session.get('user')
-    if not user:
-        return jsonify({"status": "error", "message": "Not authenticated"}), 401
-    
-    # You might want to return the OAuth token or a custom token here
-    # This example creates a simple app token based on the Cognito user
-    token = jwt.encode(
-        {"email": user.get('email'), "exp": datetime.datetime.now() + current_app.config['JWT_EXPIRATION']},
-        current_app.config['SECRET_KEY'],
-        algorithm="HS256"
-    )
-    
-    return jsonify({
-        "status": "success",
-        "token": token,
-        "user": user
-    })
-
-@auth_bp.route('/validate', methods=['POST'])
-def validate_token():
-    """Validate a token (for API access)"""
-    auth_header = request.headers.get('Authorization')
-    
-    if not auth_header:
-        return jsonify({"status": "error", "message": "Authorization header is missing"}), 401
-    
+@auth_bp.route('/proxy/login', methods=['POST'])
+@cross_origin(supports_credentials=True)
+def proxy_login():
+    """
+    Proxy endpoint for Cognito authentication that handles SECRET_HASH generation
+    """
     try:
-        # For API clients using our custom token
-        email = decode_auth_token(auth_header)
-        return jsonify({"status": "success", "email": email}), 200
-    except jwt.ExpiredSignatureError:
-        return jsonify({"status": "error", "message": "Token has expired"}), 401
-    except jwt.InvalidTokenError:
-        return jsonify({"status": "error", "message": "Invalid token"}), 401
+        data = request.get_json()
+        username = data.get('username')
+        password = data.get('password')
+        
+        # Validate inputs
+        if not username or not password:
+            return jsonify({"status": "error", "message": "Username and password are required"}), 400
+        
+        # Get Cognito credentials from environment variables
+        client_id = os.getenv('COGNITO_APP_CLIENT_ID')
+        client_secret = os.getenv('COGNITO_APP_CLIENT_SECRET')
+        
+        if not client_id or not client_secret:
+            current_app.logger.error("Missing Cognito credentials in environment variables")
+            return jsonify({"status": "error", "message": "Server configuration error"}), 500
+        
+        # Calculate SECRET_HASH
+        message = username + client_id
+        dig = hmac.new(
+            client_secret.encode('utf-8'),
+            msg=message.encode('utf-8'),
+            digestmod=hashlib.sha256
+        ).digest()
+        secret_hash = base64.b64encode(dig).decode()
+        
+        # Initialize Cognito client
+        client = boto3.client(
+            'cognito-idp',
+            region_name=os.getenv('AWS_REGION', 'eu-north-1')
+        )
+        
+        # Attempt authentication with Cognito
+        response = client.initiate_auth(
+            ClientId=client_id,
+            AuthFlow='USER_PASSWORD_AUTH',
+            AuthParameters={
+                'USERNAME': username,
+                'PASSWORD': password,
+                'SECRET_HASH': secret_hash
+            }
+        )
+        
+        # Return authentication result to the client
+        return jsonify({
+            "status": "success",
+            "message": "Login successful",
+            "tokens": {
+                "idToken": response['AuthenticationResult']['IdToken'],
+                "accessToken": response['AuthenticationResult']['AccessToken'],
+                "refreshToken": response['AuthenticationResult']['RefreshToken'],
+                "expiresIn": response['AuthenticationResult']['ExpiresIn']
+            }
+        })
+        
+    except client.exceptions.NotAuthorizedException:
+        return jsonify({"status": "error", "message": "Incorrect username or password"}), 401
+    
+    except client.exceptions.UserNotFoundException:
+        return jsonify({"status": "error", "message": "User does not exist"}), 404
+    
+    except client.exceptions.UserNotConfirmedException:
+        return jsonify({"status": "error", "message": "User is not confirmed"}), 403
+    
+    except Exception as e:
+        current_app.logger.error(f"Authentication error: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-def decode_auth_token(token):
+@auth_bp.route('/proxy/signup', methods=['POST'])
+@cross_origin(supports_credentials=True)
+def proxy_signup():
     """
-    Decode an authentication token and return the user email.
-    
-    Args:
-        token (str): The JWT token to decode
-        
-    Returns:
-        str: The user email if token is valid
-        
-    Raises:
-        jwt.ExpiredSignatureError: If the token has expired
-        jwt.InvalidTokenError: If the token is invalid
+    Proxy endpoint for Cognito user registration that handles SECRET_HASH generation
     """
-    # Remove 'Bearer ' prefix if present
-    if token.startswith('Bearer '):
-        token = token[7:]
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        password = data.get('password')
+        email = data.get('email')
         
-    # Decode the token
-    decoded = jwt.decode(
-        token, 
-        current_app.config['SECRET_KEY'], 
-        algorithms=["HS256"]
-    )
-    
-    return decoded['email']
-
-# Legacy routes with deprecation warnings - can be removed later
-@auth_bp.route('/register', methods=['POST'])
-def register():
-    """Legacy registration endpoint (deprecated)"""
-    current_app.logger.warning("Legacy registration endpoint used - should migrate to Cognito")
-    
-    data = request.json
-    email = data.get('email')
-    password = data.get('password')
-    
-    # Ensure the email and password are provided
-    if not email or not password:
-        return jsonify({"status": "error", "message": "Email and password are required"}), 400
-    
-    # Get all users from the database
-    users = database_interaction.get_users()
-    
-    if email in users:
+        # Validate inputs
+        if not username or not password or not email:
+            return jsonify({"status": "error", "message": "Username, password, and email are required"}), 400
+        
+        # Get Cognito credentials from environment variables
+        client_id = os.getenv('COGNITO_APP_CLIENT_ID')
+        client_secret = os.getenv('COGNITO_APP_CLIENT_SECRET')
+        
+        if not client_id or not client_secret:
+            current_app.logger.error("Missing Cognito credentials in environment variables")
+            return jsonify({"status": "error", "message": "Server configuration error"}), 500
+        
+        # Calculate SECRET_HASH
+        message = username + client_id
+        dig = hmac.new(
+            client_secret.encode('utf-8'),
+            msg=message.encode('utf-8'),
+            digestmod=hashlib.sha256
+        ).digest()
+        secret_hash = base64.b64encode(dig).decode()
+        
+        # Initialize Cognito client
+        client = boto3.client(
+            'cognito-idp',
+            region_name=os.getenv('AWS_REGION', 'eu-north-1')
+        )
+        
+        # Attempt user registration with Cognito
+        response = client.sign_up(
+            ClientId=client_id,
+            SecretHash=secret_hash,
+            Username=username,
+            Password=password,
+            UserAttributes=[
+                {
+                    'Name': 'email',
+                    'Value': email
+                }
+            ]
+        )
+        
+        # Return registration result to the client
+        return jsonify({
+            "status": "success",
+            "message": "User registration successful. Verification code sent to email.",
+            "userSub": response.get('UserSub')
+        })
+        
+    except client.exceptions.UsernameExistsException:
         return jsonify({"status": "error", "message": "User already exists"}), 400
     
-    # Encrypt the password before saving it
-    encrypted_password = generate_password_hash(password)
-
-    # Save user to database
-    try:
-        database_interaction.save_user(email, encrypted_password)
-        current_app.logger.info(f"User registered successfully: {email}")
-        return jsonify({
-            "status": "success", 
-            "message": "User registered successfully",
-            "note": "Consider using Cognito authentication instead of this legacy endpoint"
-        }), 201
+    except client.exceptions.InvalidPasswordException as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    
     except Exception as e:
-        current_app.logger.error(f"Failed to register user: {str(e)}")
-        return jsonify({"status": "error", "message": "Failed to register user"}), 500
+        current_app.logger.error(f"Registration error: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-@auth_bp.route('/login', methods=['POST'])
-def login():
-    """Legacy login endpoint (deprecated)"""
-    current_app.logger.warning("Legacy login endpoint used - should migrate to Cognito")
+@auth_bp.route('/proxy/confirm-signup', methods=['POST'])
+@cross_origin(supports_credentials=True)
+def proxy_confirm_signup():
+    """
+    Proxy endpoint for confirming user registration with verification code
+    """
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        confirmation_code = data.get('code')
+        
+        # Validate inputs
+        if not username or not confirmation_code:
+            return jsonify({"status": "error", "message": "Username and confirmation code are required"}), 400
+        
+        # Get Cognito credentials from environment variables
+        client_id = os.getenv('COGNITO_APP_CLIENT_ID')
+        client_secret = os.getenv('COGNITO_APP_CLIENT_SECRET')
+        
+        # Calculate SECRET_HASH
+        message = username + client_id
+        dig = hmac.new(
+            client_secret.encode('utf-8'),
+            msg=message.encode('utf-8'),
+            digestmod=hashlib.sha256
+        ).digest()
+        secret_hash = base64.b64encode(dig).decode()
+        
+        # Initialize Cognito client
+        client = boto3.client(
+            'cognito-idp',
+            region_name=os.getenv('AWS_REGION', 'eu-north-1')
+        )
+        
+        # Confirm signup
+        client.confirm_sign_up(
+            ClientId=client_id,
+            SecretHash=secret_hash,
+            Username=username,
+            ConfirmationCode=confirmation_code
+        )
+        
+        return jsonify({
+            "status": "success",
+            "message": "User confirmed successfully"
+        })
+        
+    except client.exceptions.CodeMismatchException:
+        return jsonify({"status": "error", "message": "Invalid verification code"}), 400
     
-    data = request.json
-    email = data.get('email')
-    password = data.get('password')
-
-    # Ensure the email and password are provided
-    if not email or not password:
-        return jsonify({"status": "error", "message": "Email and password are required"}), 400
-
-    # Get all users from the database
-    users = database_interaction.get_users()
+    except client.exceptions.ExpiredCodeException:
+        return jsonify({"status": "error", "message": "Verification code has expired"}), 400
     
-    if email not in users:
-        return jsonify({"status": "error", "message": "User not found"}), 404
-    
-    # Check if the password matches the hashed password in the database
-    hashed_password = users[email]
-    if not check_password_hash(hashed_password, password):
-        return jsonify({"status": "error", "message": "Invalid password"}), 401
+    except Exception as e:
+        current_app.logger.error(f"Confirmation error: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
 
-    # Authentication successful
-    current_app.logger.info(f"User logged in: {email}")
-
-    # Generate JWT token
-    token = jwt.encode(
-        {"email": email, "exp": datetime.datetime.now() + current_app.config['JWT_EXPIRATION']},
-        current_app.config['SECRET_KEY'],
-        algorithm="HS256"
-    )
+@auth_bp.route('/proxy/forgot-password', methods=['POST'])
+@cross_origin(supports_credentials=True)
+def proxy_forgot_password():
+    """
+    Proxy endpoint for initiating password reset
+    """
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        
+        # Validate inputs
+        if not username:
+            return jsonify({"status": "error", "message": "Username is required"}), 400
+        
+        # Get Cognito credentials from environment variables
+        client_id = os.getenv('COGNITO_APP_CLIENT_ID')
+        client_secret = os.getenv('COGNITO_APP_CLIENT_SECRET')
+        
+        # Calculate SECRET_HASH
+        message = username + client_id
+        dig = hmac.new(
+            client_secret.encode('utf-8'),
+            msg=message.encode('utf-8'),
+            digestmod=hashlib.sha256
+        ).digest()
+        secret_hash = base64.b64encode(dig).decode()
+        
+        # Initialize Cognito client
+        client = boto3.client(
+            'cognito-idp',
+            region_name=os.getenv('AWS_REGION', 'eu-north-1')
+        )
+        
+        # Initiate forgot password flow
+        client.forgot_password(
+            ClientId=client_id,
+            SecretHash=secret_hash,
+            Username=username
+        )
+        
+        return jsonify({
+            "status": "success",
+            "message": "Password reset code sent"
+        })
+        
+    except client.exceptions.UserNotFoundException:
+        return jsonify({"status": "error", "message": "User does not exist"}), 404
     
-    return jsonify({
-        "status": "success", 
-        "token": token,
-        "note": "Consider using Cognito authentication instead of this legacy endpoint"
-    }), 200
+    except client.exceptions.InvalidParameterException as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    
+    except Exception as e:
+        current_app.logger.error(f"Forgot password error: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500
+
+@auth_bp.route('/proxy/confirm-forgot-password', methods=['POST'])
+@cross_origin(supports_credentials=True)
+def proxy_confirm_forgot_password():
+    """
+    Proxy endpoint for confirming password reset
+    """
+    try:
+        data = request.get_json()
+        username = data.get('username')
+        confirmation_code = data.get('code')
+        new_password = data.get('password')
+        
+        # Validate inputs
+        if not username or not confirmation_code or not new_password:
+            return jsonify({"status": "error", "message": "Username, confirmation code, and new password are required"}), 400
+        
+        # Get Cognito credentials from environment variables
+        client_id = os.getenv('COGNITO_APP_CLIENT_ID')
+        client_secret = os.getenv('COGNITO_APP_CLIENT_SECRET')
+        
+        # Calculate SECRET_HASH
+        message = username + client_id
+        dig = hmac.new(
+            client_secret.encode('utf-8'),
+            msg=message.encode('utf-8'),
+            digestmod=hashlib.sha256
+        ).digest()
+        secret_hash = base64.b64encode(dig).decode()
+        
+        # Initialize Cognito client
+        client = boto3.client(
+            'cognito-idp',
+            region_name=os.getenv('AWS_REGION', 'eu-north-1')
+        )
+        
+        # Confirm password reset
+        client.confirm_forgot_password(
+            ClientId=client_id,
+            SecretHash=secret_hash,
+            Username=username,
+            ConfirmationCode=confirmation_code,
+            Password=new_password
+        )
+        
+        return jsonify({
+            "status": "success",
+            "message": "Password reset successfully"
+        })
+        
+    except client.exceptions.CodeMismatchException:
+        return jsonify({"status": "error", "message": "Invalid verification code"}), 400
+    
+    except client.exceptions.ExpiredCodeException:
+        return jsonify({"status": "error", "message": "Verification code has expired"}), 400
+    
+    except client.exceptions.InvalidPasswordException as e:
+        return jsonify({"status": "error", "message": str(e)}), 400
+    
+    except Exception as e:
+        current_app.logger.error(f"Confirm forgot password error: {str(e)}")
+        return jsonify({"status": "error", "message": str(e)}), 500

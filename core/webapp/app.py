@@ -17,6 +17,9 @@ import ssl
 import logging
 import click
 
+import dotenv
+
+
 
 
 # Configure logging
@@ -31,11 +34,13 @@ def create_app(config_class=Config):
     app.secret_key = os.urandom(24)  # Use a secure random key in production
     oauth = OAuth(app)
 
+    dotenv.load_dotenv(override=True)
+
     oauth.register(
     name='oidc',
     authority='https://cognito-idp.eu-north-1.amazonaws.com/eu-north-1_oh72FkuWi',
-    client_id='6fvcfv0kh50t2ukq800jckf0ic',
-    client_secret='<client secret>',
+    client_id=os.getenv('COGNITO_APP_CLIENT_ID'),
+    client_secret=os.getenv('COGNITO_APP_CLIENT_SECRET'),
     server_metadata_url='https://cognito-idp.eu-north-1.amazonaws.com/eu-north-1_oh72FkuWi/.well-known/openid-configuration',
     client_kwargs={'scope': 'phone openid email'}
     )
@@ -110,7 +115,9 @@ def main(certfile, keyfile):
     if certfile and keyfile:
         ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_ctx.load_cert_chain(certfile, keyfile)
-    socketio.run(app, host='0.0.0.0', port=5000, ssl_context=ssl_ctx)
+        socketio.run(app, host='0.0.0.0', port=5000, ssl_context=ssl_ctx)
+    else:
+        socketio.run(app, host='0.0.0.0', port=5000)
 
 if __name__ == '__main__':
     main()
