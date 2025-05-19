@@ -5,6 +5,9 @@ import hmac
 import hashlib
 import base64
 from flask_cors import cross_origin
+import dotenv
+
+dotenv.load_dotenv(override=True)
 
 auth_bp = Blueprint('auth', __name__)
 
@@ -93,11 +96,28 @@ def proxy_signup():
         username = data.get('username')
         password = data.get('password')
         email = data.get('email')
+        name = data.get('name')
+        birthdate = data.get('birthdate')
+        gender = data.get('gender')
+        locale = data.get('locale')
         
         # Validate inputs
-        if not username or not password or not email:
-            return jsonify({"status": "error", "message": "Username, password, and email are required"}), 400
+        if not username or not password or not email or not name or not birthdate or not gender or not locale:
+            missing_fields = []
+            if not username: missing_fields.append("username")
+            if not password: missing_fields.append("password")
+            if not email: missing_fields.append("email")
+            if not name: missing_fields.append("name")
+            if not birthdate: missing_fields.append("birthdate")
+            if not gender: missing_fields.append("gender")
+            if not locale: missing_fields.append("locale")
+            
+            return jsonify({
+                "status": "error", 
+                "message": f"Missing required fields: {', '.join(missing_fields)}"
+            }), 400
         
+        dotenv.load_dotenv(override=True)
         # Get Cognito credentials from environment variables
         client_id = os.getenv('COGNITO_APP_CLIENT_ID')
         client_secret = os.getenv('COGNITO_APP_CLIENT_SECRET')
@@ -106,34 +126,46 @@ def proxy_signup():
             current_app.logger.error("Missing Cognito credentials in environment variables")
             return jsonify({"status": "error", "message": "Server configuration error"}), 500
         
-        # Calculate SECRET_HASH
-        message = username + client_id
-        dig = hmac.new(
-            client_secret.encode('utf-8'),
-            msg=message.encode('utf-8'),
-            digestmod=hashlib.sha256
-        ).digest()
-        secret_hash = base64.b64encode(dig).decode()
-        
-        # Initialize Cognito client
+        # Create Cognito client
         client = boto3.client(
             'cognito-idp',
             region_name=os.getenv('AWS_REGION', 'eu-north-1')
         )
         
+        # Calculate SECRET_HASH (only if client secret is provided)
+        secret_hash = None
+        if client_secret:
+            message = username + client_id
+            dig = hmac.new(
+                client_secret.encode('utf-8'),
+                msg=message.encode('utf-8'),
+                digestmod=hashlib.sha256
+            ).digest()
+            secret_hash = base64.b64encode(dig).decode()
+        
+        # Prepare user attributes
+        user_attributes = [
+            {'Name': 'email', 'Value': email},
+            {'Name': 'name', 'Value': name},
+            {'Name': 'birthdate', 'Value': birthdate},
+            {'Name': 'gender', 'Value': gender},
+            {'Name': 'locale', 'Value': locale}
+        ]
+        
+        # Prepare sign_up params
+        signup_params = {
+            'ClientId': client_id,
+            'Username': username,
+            'Password': password,
+            'UserAttributes': user_attributes
+        }
+        
+        # Add SecretHash if available
+        if secret_hash:
+            signup_params['SecretHash'] = secret_hash
+        
         # Attempt user registration with Cognito
-        response = client.sign_up(
-            ClientId=client_id,
-            SecretHash=secret_hash,
-            Username=username,
-            Password=password,
-            UserAttributes=[
-                {
-                    'Name': 'email',
-                    'Value': email
-                }
-            ]
-        )
+        response = client.sign_up(**signup_params)
         
         # Return registration result to the client
         return jsonify({
@@ -147,6 +179,9 @@ def proxy_signup():
     
     except client.exceptions.InvalidPasswordException as e:
         return jsonify({"status": "error", "message": str(e)}), 400
+    
+    except client.exceptions.InvalidParameterException as e:
+        return jsonify({"status": "error", "message": f"Invalid parameter: {str(e)}"}), 400
     
     except Exception as e:
         current_app.logger.error(f"Registration error: {str(e)}")
@@ -170,6 +205,10 @@ def proxy_confirm_signup():
         # Get Cognito credentials from environment variables
         client_id = os.getenv('COGNITO_APP_CLIENT_ID')
         client_secret = os.getenv('COGNITO_APP_CLIENT_SECRET')
+        
+        if not client_id or not client_secret:
+            current_app.logger.error("Missing Cognito credentials in environment variables")
+            return jsonify({"status": "error", "message": "Server configuration error: Missing Cognito credentials"}), 500
         
         # Calculate SECRET_HASH
         message = username + client_id
@@ -200,9 +239,11 @@ def proxy_confirm_signup():
         })
         
     except client.exceptions.CodeMismatchException:
+        current_app.logger.error(f"Invalid verification code for user: {username}")
         return jsonify({"status": "error", "message": "Invalid verification code"}), 400
     
     except client.exceptions.ExpiredCodeException:
+        current_app.logger.error(f"Expired verification code for user: {username}")
         return jsonify({"status": "error", "message": "Verification code has expired"}), 400
     
     except Exception as e:
@@ -223,6 +264,7 @@ def proxy_forgot_password():
         if not username:
             return jsonify({"status": "error", "message": "Username is required"}), 400
         
+        dotenv.load_dotenv(override=True)
         # Get Cognito credentials from environment variables
         client_id = os.getenv('COGNITO_APP_CLIENT_ID')
         client_secret = os.getenv('COGNITO_APP_CLIENT_SECRET')
@@ -280,6 +322,7 @@ def proxy_confirm_forgot_password():
         if not username or not confirmation_code or not new_password:
             return jsonify({"status": "error", "message": "Username, confirmation code, and new password are required"}), 400
         
+        dotenv.load_dotenv(override=True)
         # Get Cognito credentials from environment variables
         client_id = os.getenv('COGNITO_APP_CLIENT_ID')
         client_secret = os.getenv('COGNITO_APP_CLIENT_SECRET')
