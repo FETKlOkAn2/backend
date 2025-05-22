@@ -19,9 +19,6 @@ import click
 
 import dotenv
 
-
-
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -44,12 +41,20 @@ def create_app(config_class=Config):
     server_metadata_url='https://cognito-idp.eu-north-1.amazonaws.com/eu-north-1_oh72FkuWi/.well-known/openid-configuration',
     client_kwargs={'scope': 'phone openid email'}
     )
-    # Enable CORS with more detailed configuration
+    
+    # Enable CORS with support for localhost development and production
+    allowed_origins = [
+        "https://main.d1ygo5bg0er0wr.amplifyapp.com",  # Production
+        "http://localhost:5173",  # Vite dev server
+        "http://localhost:3000",  # Common React dev port
+        "http://127.0.0.1:5173",  # Alternative localhost
+    ]
+    
     CORS(
         app,
         resources={
             r"/*": {
-                "origins": "https://main.d1ygo5bg0er0wr.amplifyapp.com",
+                "origins": allowed_origins,
                 "supports_credentials": True,
                 "allow_headers": [
                     "Content-Type",
@@ -91,7 +96,12 @@ app = create_app()
 # Configure Socket.IO with proper CORS settings
 socketio = SocketIO(
     app, 
-    cors_allowed_origins="*",  # List of allowed origins
+    cors_allowed_origins=[
+        "https://main.d1ygo5bg0er0wr.amplifyapp.com",
+        "http://localhost:5173",
+        "http://localhost:3000",
+        "http://127.0.0.1:5173"
+    ],
     async_mode='gevent', 
     logger=True, 
     engineio_logger=True,
