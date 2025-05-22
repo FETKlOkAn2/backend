@@ -64,7 +64,8 @@ class MSSQLDatabase:
         self.driver = "ODBC+Driver+18+for+SQL+Server"
         self.engine = self.get_engine()
         self.lock = Lock()
-        
+
+ 
     def table_exists(self, schema_name, table_name):
         """Check if a table exists in the specified schema."""
         sql = f"SELECT CASE WHEN OBJECT_ID('[{schema_name}].[{table_name}]', 'U') IS NOT NULL THEN 1 ELSE 0 END as table_exists"
@@ -77,6 +78,7 @@ class MSSQLDatabase:
             f"mssql+pyodbc://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}?"
             f"driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes"
         )
+       
         return create_engine(url, pool_pre_ping=True)  # Removed fast_executemany=True
 
     def execute_sql(self, sql_text, params=None):
@@ -382,12 +384,7 @@ def get_best_params_without_df(strategy_name, symbol, granularity, minimum_trade
         return None
     finally:
         pass
-def get_users():
-    db = MSSQLDatabase('users')
-    query = "SELECT email, password FROM users;"
-    users = db.read_sql_query(query)
-    users_dict = dict(zip(users['email'], users['password']))
-    return users_dict
+
 def save_user(email, password, privacy_policy_accepted=False, api_key=None):
     db = MSSQLDatabase('users')
     df = pd.DataFrame(columns=['email', 'password', 'privacy_policy_accepted', 'api_key'])
@@ -398,15 +395,7 @@ def save_user(email, password, privacy_policy_accepted=False, api_key=None):
     db.to_sql(df, 'users', if_exists='append', index=False)
 
 
-#save_user("test_user", "test_password")
-def get_backtest_history(email):
-    db = MSSQLDatabase('backtests')
-    df = pd.DataFrame(columns=['email', 'symbol', 'strategy', 'result', 'date'])
-    db.create_table_if_not_exists('backtests',df)
-    query = f"SELECT * FROM backtests WHERE email = ?"
-    history = db.read_sql_query(query, params={'email': email})
-    return history.to_dict(orient="records")
-
+    
 import json
 import datetime
 import pandas as pd
@@ -428,13 +417,13 @@ def save_backtest(email, symbol, strategy, result, date):
     # Serialize the processed result into JSON
     result_json = json.dumps(serializable_result)
     
-    db = MSSQLDatabase('backtests')
+    db = MSSQLDatabase('backtest')
     df = pd.DataFrame(columns=['email', 'symbol', 'strategy', 'result', 'date'])
-    db.create_table_if_not_exists('backtests',df)
+    db.create_table_if_not_exists('backtest',df)
 
     data = {'email': email, 'symbol': symbol, 'strategy': strategy, 'result': result_json, 'date': date}
     df = pd.DataFrame([data])
-    db.to_sql(df, 'backtests', if_exists='append', index=False)
+    db.to_sql(df, 'backtest', if_exists='append', index=False)
 
 
 def export_hyper_to_db(strategy: object, hyper: object):
@@ -2532,38 +2521,48 @@ def update_risk_settings(email, risk_percent, max_drawdown, max_open_trades):
 
 def get_backtest_history(email):
     """Get user's backtest history."""
-    db = MSSQLDatabase('users')
+    db = MSSQLDatabase('backtest')
     try:
-        # Check if table exists
+        # Check if backtests table exists
         result = db.read_sql_query(
             """SELECT COUNT(*) AS table_count FROM INFORMATION_SCHEMA.TABLES 
                WHERE TABLE_NAME = 'backtests'"""
         )
         
         if result.iloc[0]['table_count'] == 0:
-            # Create backtests table if it doesn't exist
-            db.execute_sql(
-                """CREATE TABLE backtests (
-                    id INT IDENTITY(1,1) PRIMARY KEY,
-                    email NVARCHAR(255),
-                    symbol NVARCHAR(50),
-                    strategy NVARCHAR(50),
-                    result NVARCHAR(MAX),
-                    date NVARCHAR(50)
-                )"""
-            )
+            logger.warning("backtests table does not exist")
             return []
         
-        # Get backtest history
-        history = db.read_sql_query(
-            "SELECT * FROM backtests WHERE email = ?",
-            (email,)
-        )
+        # Use string formatting directly since it's working
+        # Proper SQL escaping for email
+        escaped_email = email.replace("'", "''")
+        history = db.read_sql_query(f"SELECT * FROM backtests WHERE email = '{escaped_email}'")
         
-        return history.to_dict(orient="records")
+        if history is None or history.empty:
+            logger.info(f"No backtest history found for {email}")
+            return []
+        
+        result_list = []
+        for _, row in history.iterrows():
+            result_list.append({
+                'email': str(row['email']) if pd.notna(row['email']) else None,
+                'symbol': str(row['symbol']) if pd.notna(row['symbol']) else None,
+                'strategy': str(row['strategy']) if pd.notna(row['strategy']) else None,
+                'result': str(row['result']) if pd.notna(row['result']) else None,
+                'date': str(row['date']) if pd.notna(row['date']) else None
+            })
+        
+        logger.info(f"Found {len(result_list)} backtest records for {email}")
+        return result_list
+        
     except Exception as e:
         logger.error(f"Error getting backtest history for {email}: {str(e)}")
         return []
+    finally:
+        try:
+            db.close()
+        except:
+            pass
 
 def save_password_reset_token(email, reset_token, expires_at):
     """Save a password reset token for a user."""
