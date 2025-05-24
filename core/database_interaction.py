@@ -65,7 +65,6 @@ class MSSQLDatabase:
         self.engine = self.get_engine()
         self.lock = Lock()
 
- 
     def table_exists(self, schema_name, table_name):
         """Check if a table exists in the specified schema."""
         sql = f"SELECT CASE WHEN OBJECT_ID('[{schema_name}].[{table_name}]', 'U') IS NOT NULL THEN 1 ELSE 0 END as table_exists"
@@ -78,25 +77,66 @@ class MSSQLDatabase:
             f"mssql+pyodbc://{self.user}:{self.password}@{self.host}:{self.port}/{self.db}?"
             f"driver=ODBC+Driver+18+for+SQL+Server&TrustServerCertificate=yes"
         )
-       
-        return create_engine(url, pool_pre_ping=True)  # Removed fast_executemany=True
+        return create_engine(url, pool_pre_ping=True)
 
     def execute_sql(self, sql_text, params=None):
+        """Execute SQL with proper parameter handling."""
         with self.lock, self.engine.begin() as conn:
             if params:
-                return conn.execute(text(sql_text), params)
+                if isinstance(params, (list, tuple)):
+                    # Convert positional parameters to named parameters
+                    param_count = sql_text.count('?')
+                    if len(params) != param_count:
+                        raise ValueError(f"Parameter count mismatch: expected {param_count}, got {len(params)}")
+                    
+                    # Create named parameter dictionary
+                    param_dict = {f'param_{i}': param for i, param in enumerate(params)}
+                    
+                    # Replace ? placeholders with named parameters
+                    modified_sql = sql_text
+                    for i in range(param_count):
+                        modified_sql = modified_sql.replace('?', f':param_{i}', 1)
+                    
+                    logger.debug(f"Modified SQL: {modified_sql}")
+                    logger.debug(f"Parameters: {param_dict}")
+                    
+                    return conn.execute(text(modified_sql), param_dict)
+                else:
+                    # Dictionary parameters - use as-is
+                    return conn.execute(text(sql_text), params)
             else:
                 return conn.execute(text(sql_text))
 
     def read_sql_query(self, sql_text, params=None):
+        """Execute SQL query and return DataFrame with proper parameter handling."""
         with self.lock, self.engine.begin() as conn:
             if params:
-                return pd.read_sql_query(text(sql_text), conn, params=params)
+                if isinstance(params, (list, tuple)):
+                    # Convert positional parameters to named parameters
+                    param_count = sql_text.count('?')
+                    if len(params) != param_count:
+                        raise ValueError(f"Parameter count mismatch: expected {param_count}, got {len(params)}")
+                    
+                    # Create named parameter dictionary
+                    param_dict = {f'param_{i}': param for i, param in enumerate(params)}
+                    
+                    # Replace ? placeholders with named parameters
+                    modified_sql = sql_text
+                    for i in range(param_count):
+                        modified_sql = modified_sql.replace('?', f':param_{i}', 1)
+                    
+                    logger.debug(f"Modified SQL: {modified_sql}")
+                    logger.debug(f"Parameters: {param_dict}")
+                    
+                    return pd.read_sql_query(text(modified_sql), conn, params=param_dict)
+                else:
+                    # Dictionary parameters - use as-is
+                    return pd.read_sql_query(text(sql_text), conn, params=params)
             else:
                 return pd.read_sql_query(text(sql_text), conn)
 
     def to_sql(self, df, table_name, schema=None, if_exists='append', index=False):
-        # Modified to use smaller chunk size and avoid using method='multi'
+        """Write DataFrame to SQL table."""
         with self.lock:
             df.to_sql(
                 table_name, 
@@ -104,8 +144,13 @@ class MSSQLDatabase:
                 schema=schema,
                 if_exists=if_exists, 
                 index=index, 
-                chunksize=100  # Smaller chunk size
+                chunksize=100
             )
+
+    def close(self):
+        """Close the database engine."""
+        if hasattr(self, 'engine') and self.engine:
+            self.engine.dispose()
 
     def create_table_if_not_exists(self, table_name, df):
         """
@@ -385,17 +430,6 @@ def get_best_params_without_df(strategy_name, symbol, granularity, minimum_trade
     finally:
         pass
 
-def save_user(email, password, privacy_policy_accepted=False, api_key=None):
-    db = MSSQLDatabase('users')
-    df = pd.DataFrame(columns=['email', 'password', 'privacy_policy_accepted', 'api_key'])
-    db.create_table_if_not_exists('users',df)
-    
-    data = {'email': email, 'password': password, 'privacy_policy_accepted': privacy_policy_accepted, 'api_key': api_key}
-    df = pd.DataFrame([data])
-    db.to_sql(df, 'users', if_exists='append', index=False)
-
-
-    
 import json
 import datetime
 import pandas as pd
@@ -1925,7 +1959,7 @@ def activate_2fa(email, totp_secret):
         logger.error(f"Error activating 2FA for {email}: {str(e)}")
         raise
 
-def save_user(email, password, privacy_policy_accepted=False, api_key=None, 
+def save_user(email, privacy_policy_accepted=False, api_key=None, 
               risk_percent=0.02, max_drawdown=0.15, max_open_trades=3):
     """Save a new user with default risk settings and setup state."""
     db = MSSQLDatabase('users')
@@ -1938,9 +1972,9 @@ def save_user(email, password, privacy_policy_accepted=False, api_key=None,
                 password NVARCHAR(255),
                 privacy_policy_accepted BIT,
                 api_key NVARCHAR(255),
-                risk_percent NVARCHAR(50),
-                max_drawdown NVARCHAR(50),
-                max_open_trades NVARCHAR(50),
+                risk_percent DECIMAL(10,6),
+                max_drawdown DECIMAL(10,6),
+                max_open_trades INT,
                 platform_connected BIT,
                 email_verified BIT,
                 twofa_enabled BIT,
@@ -1950,9 +1984,21 @@ def save_user(email, password, privacy_policy_accepted=False, api_key=None,
             )"""
         )
         
-        current_time = datetime.now().isoformat()
+        current_time = datetime.datetime.now().isoformat()
         
-        # Insert new user
+        # Insert new user with proper parameter binding
+        params = (
+            email, 
+            '-', 
+            1 if privacy_policy_accepted else 0, 
+            api_key or '', 
+            float(risk_percent), 
+            float(max_drawdown), 
+            int(max_open_trades),
+            0, 0, 0, 0, '', 
+            current_time
+        )
+        
         db.execute_sql(
             """INSERT INTO users 
                (email, password, privacy_policy_accepted, api_key, 
@@ -1960,15 +2006,15 @@ def save_user(email, password, privacy_policy_accepted=False, api_key=None,
                 platform_connected, email_verified, twofa_enabled, setup_complete,
                 setup_completion_time, created_at) 
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);""", 
-            (email, password, 1 if privacy_policy_accepted else 0, api_key, 
-             str(risk_percent), str(max_drawdown), str(max_open_trades),
-             0, 0, 0, 0, None, current_time)
+            params
         )
         
         logger.info(f"User {email} registered with default risk settings")
     except Exception as e:
         logger.error(f"Error saving user {email}: {str(e)}")
         raise
+    finally:
+        db.close()
 
 def save_user_platform(email, platform, timestamp):
     """Save user platform connection information."""
@@ -2423,101 +2469,350 @@ def mark_setup_complete(email, completion_time):
         raise
 
 def get_risk_settings(email):
-    """Get user's risk settings."""
-    db = MSSQLDatabase('users')
+    """Get user's risk settings with enhanced error handling."""
+    logger.info(f"=== get_risk_settings called for email: {email} ===")
+    
+    if not email:
+        logger.error("Email parameter is required")
+        return None
+    
+    db = None
     try:
-        # Check if the table has risk columns
-        columns_result = db.read_sql_query(
-            """SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
-               WHERE TABLE_NAME = 'users'"""
-        )
-        columns = columns_result['COLUMN_NAME'].tolist()
+        db = MSSQLDatabase('users')
+        logger.info("Database connection established")
+    except Exception as db_init_error:
+        logger.error(f"Failed to initialize database connection: {str(db_init_error)}")
+        return None
         
-        # If risk columns don't exist, add them and set defaults
-        missing_columns = []
-        for col in ['risk_percent', 'max_drawdown', 'max_open_trades']:
-            if col not in columns:
-                missing_columns.append(col)
-        
-        if missing_columns:
-            for col in missing_columns:
-                db.execute_sql(f"ALTER TABLE users ADD {col} NVARCHAR(50)")
-                
-            # Set default values for the new columns
-            db.execute_sql(
-                """UPDATE users SET risk_percent = ?, max_drawdown = ?, max_open_trades = ? 
-                   WHERE email = ?""",
-                ('0.02', '0.15', '3', email)
-            )
-        
-        # Query the risk settings
-        result = db.read_sql_query(
-            """SELECT risk_percent, max_drawdown, max_open_trades 
-               FROM users WHERE email = ?""", 
-            (email,)
+    try:
+        # First, ensure the user exists
+        logger.info(f"Checking if user exists: {email}")
+        user_check = db.read_sql_query(
+            "SELECT COUNT(*) AS user_count FROM users WHERE email = ?", 
+            params=(email,)
         )
         
-        if result.empty:
+        if user_check.empty:
+            logger.error("User check query returned empty result")
             return None
             
-        # Convert from strings to appropriate types
-        risk_percent = float(result.iloc[0]['risk_percent'] or 0.02)
-        max_drawdown = float(result.iloc[0]['max_drawdown'] or 0.15)
-        max_open_trades = int(result.iloc[0]['max_open_trades'] or 3)
+        user_count = user_check.iloc[0]['user_count']
+        logger.info(f"User count for {email}: {user_count}")
         
-        return {
-            "risk_percent": risk_percent,
-            "max_drawdown": max_drawdown,
-            "max_open_trades": max_open_trades
+        if user_count == 0:
+            logger.warning(f"User not found: {email}")
+            return None
+        
+        # Check if the table has risk columns
+        logger.info("Checking table schema for risk columns")
+        try:
+            columns_result = db.read_sql_query(
+                """SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+                   WHERE TABLE_NAME = 'users' AND TABLE_SCHEMA = 'dbo'"""
+            )
+        except Exception as schema_error:
+            logger.error(f"Error checking table schema: {str(schema_error)}")
+            try:
+                columns_result = db.read_sql_query(
+                    "SELECT name FROM sys.columns WHERE object_id = OBJECT_ID('users')"
+                )
+                columns_result = columns_result.rename(columns={'name': 'COLUMN_NAME'})
+            except Exception as alt_schema_error:
+                logger.error(f"Alternative schema check also failed: {str(alt_schema_error)}")
+                return None
+        
+        if columns_result.empty:
+            logger.error("Could not retrieve table schema information")
+            return None
+            
+        columns = [col.lower() for col in columns_result['COLUMN_NAME'].tolist()]
+        logger.info(f"Available columns: {columns}")
+        
+        # Define risk columns with their data types
+        risk_columns = {
+            'risk_percent': 'DECIMAL(10,6)',
+            'max_drawdown': 'DECIMAL(10,6)', 
+            'max_open_trades': 'INT'
         }
+        
+        # Add missing columns
+        missing_columns = []
+        for col_name, col_type in risk_columns.items():
+            if col_name.lower() not in columns:
+                missing_columns.append((col_name, col_type))
+        
+        if missing_columns:
+            logger.info(f"Adding missing risk columns: {[col[0] for col in missing_columns]}")
+            for col_name, col_type in missing_columns:
+                try:
+                    alter_sql = f"ALTER TABLE users ADD {col_name} {col_type}"
+                    logger.info(f"Executing: {alter_sql}")
+                    db.execute_sql(alter_sql)
+                    logger.info(f"Successfully added column {col_name}")
+                except Exception as alter_e:
+                    logger.error(f"Failed to add column {col_name}: {str(alter_e)}")
+            
+            # Set default values for the user
+            try:
+                update_sql = """UPDATE users 
+                               SET risk_percent = COALESCE(risk_percent, 0.02),
+                                   max_drawdown = COALESCE(max_drawdown, 0.15),
+                                   max_open_trades = COALESCE(max_open_trades, 3)
+                               WHERE email = ?"""
+                logger.info(f"Setting default values for user: {email}")
+                db.execute_sql(update_sql, params=(email,))
+                logger.info("Default values set successfully")
+            except Exception as default_error:
+                logger.error(f"Error setting default values: {str(default_error)}")
+        
+        # Query the risk settings
+        logger.info(f"Querying risk settings for user: {email}")
+        try:
+            result = db.read_sql_query(
+                """SELECT 
+                    COALESCE(risk_percent, 0.02) as risk_percent,
+                    COALESCE(max_drawdown, 0.15) as max_drawdown,
+                    COALESCE(max_open_trades, 3) as max_open_trades
+                   FROM users WHERE email = ?""", 
+                params=(email,)
+            )
+        except Exception as query_error:
+            logger.error(f"Error in main query: {str(query_error)}")
+            try:
+                logger.info("Attempting fallback query")
+                result = db.read_sql_query(
+                    "SELECT * FROM users WHERE email = ?", 
+                    params=(email,)
+                )
+                if not result.empty:
+                    risk_data = {}
+                    for col in ['risk_percent', 'max_drawdown', 'max_open_trades']:
+                        if col in result.columns:
+                            risk_data[col] = result.iloc[0][col]
+                        else:
+                            defaults = {'risk_percent': 0.02, 'max_drawdown': 0.15, 'max_open_trades': 3}
+                            risk_data[col] = defaults[col]
+                    
+                    import pandas as pd
+                    result = pd.DataFrame([risk_data])
+                else:
+                    logger.error("Fallback query also returned empty result")
+                    return None
+            except Exception as fallback_error:
+                logger.error(f"Fallback query also failed: {str(fallback_error)}")
+                return None
+        
+        if result.empty:
+            logger.warning(f"No risk settings found for user: {email}")
+            return None
+        
+        logger.info(f"Raw query result: {result.to_dict()}")
+        
+        # Convert to appropriate types with validation
+        try:
+            risk_percent = float(result.iloc[0]['risk_percent']) if result.iloc[0]['risk_percent'] is not None else 0.02
+            max_drawdown = float(result.iloc[0]['max_drawdown']) if result.iloc[0]['max_drawdown'] is not None else 0.15
+            max_open_trades = int(result.iloc[0]['max_open_trades']) if result.iloc[0]['max_open_trades'] is not None else 3
+            
+            logger.info(f"Raw values - risk_percent: {risk_percent}, max_drawdown: {max_drawdown}, max_open_trades: {max_open_trades}")
+            
+            # Validate ranges and apply bounds
+            risk_percent = max(0.001, min(1.0, risk_percent))
+            max_drawdown = max(0.01, min(1.0, max_drawdown))
+            max_open_trades = max(1, min(50, max_open_trades))
+            
+            result_dict = {
+                "risk_percent": risk_percent,
+                "max_drawdown": max_drawdown,
+                "max_open_trades": max_open_trades
+            }
+            
+            logger.info(f"Returning validated risk settings: {result_dict}")
+            return result_dict
+            
+        except (ValueError, TypeError) as conv_e:
+            logger.error(f"Error converting risk settings data types for {email}: {str(conv_e)}")
+            logger.info("Returning default values due to conversion error")
+            return {
+                "risk_percent": 0.02,
+                "max_drawdown": 0.15,
+                "max_open_trades": 3
+            }
+            
     except Exception as e:
-        logger.error(f"Error getting risk settings for {email}: {str(e)}")
+        logger.error(f"Unexpected error getting risk settings for {email}: {str(e)}")
+        logger.exception("Full error traceback:")
         return None
+    finally:
+        if db:
+            try:
+                db.close()
+                logger.info("Database connection closed")
+            except Exception as close_error:
+                logger.error(f"Error closing database connection: {str(close_error)}")
+
 
 def update_risk_settings(email, risk_percent, max_drawdown, max_open_trades):
     """Update user's risk settings."""
-    db = MSSQLDatabase('users')
-    try:
-        # Check if the table has risk columns
-        columns_result = db.read_sql_query(
-            """SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
-               WHERE TABLE_NAME = 'users'"""
-        )
-        columns = columns_result['COLUMN_NAME'].tolist()
+    logger.info(f"=== update_risk_settings called ===")
+    logger.info(f"Parameters: email={email}, risk_percent={risk_percent}, max_drawdown={max_drawdown}, max_open_trades={max_open_trades}")
+    
+    if not email:
+        logger.error("Email parameter is required")
+        return False
         
-        # If risk columns don't exist, add them
+    # Validate input parameters
+    try:
+        risk_percent = float(risk_percent)
+        max_drawdown = float(max_drawdown)
+        max_open_trades = int(max_open_trades)
+        
+        logger.info(f"Converted parameters: risk_percent={risk_percent}, max_drawdown={max_drawdown}, max_open_trades={max_open_trades}")
+        
+        # Validate ranges
+        if not (0.001 <= risk_percent <= 1.0):
+            logger.error(f"Invalid risk_percent value: {risk_percent}")
+            return False
+        if not (0.01 <= max_drawdown <= 1.0):
+            logger.error(f"Invalid max_drawdown value: {max_drawdown}")
+            return False
+        if not (1 <= max_open_trades <= 50):
+            logger.error(f"Invalid max_open_trades value: {max_open_trades}")
+            return False
+            
+    except (ValueError, TypeError) as e:
+        logger.error(f"Invalid parameter types for risk settings: {str(e)}")
+        return False
+    
+    db = None
+    try:
+        db = MSSQLDatabase('users')
+        
+        # First, ensure the user exists
+        logger.info(f"Checking if user exists: {email}")
+        user_check = db.read_sql_query(
+            "SELECT COUNT(*) AS user_count FROM users WHERE email = ?", 
+            params=(email,)
+        )
+        
+        if user_check.empty or user_check.iloc[0]['user_count'] == 0:
+            logger.error(f"Cannot update risk settings: User not found: {email}")
+            return False
+        
+        logger.info(f"User exists, proceeding with update")
+        
+        # Check if the table has risk columns
+        try:
+            columns_result = db.read_sql_query(
+                """SELECT COLUMN_NAME FROM INFORMATION_SCHEMA.COLUMNS 
+                   WHERE TABLE_NAME = 'users' AND TABLE_SCHEMA = 'dbo'"""
+            )
+        except Exception as schema_error:
+            logger.warning(f"INFORMATION_SCHEMA query failed, trying alternative: {str(schema_error)}")
+            try:
+                columns_result = db.read_sql_query(
+                    "SELECT name as COLUMN_NAME FROM sys.columns WHERE object_id = OBJECT_ID('users')"
+                )
+            except Exception as alt_error:
+                logger.error(f"Could not get table schema: {str(alt_error)}")
+                return False
+        
+        if columns_result.empty:
+            logger.error("Could not retrieve table schema information")
+            return False
+            
+        columns = [col.lower() for col in columns_result['COLUMN_NAME'].tolist()]
+        logger.info(f"Available columns: {columns}")
+        
+        # Define risk columns with their data types
+        risk_columns = {
+            'risk_percent': 'DECIMAL(10,6)',
+            'max_drawdown': 'DECIMAL(10,6)', 
+            'max_open_trades': 'INT'
+        }
+        
+        # Add missing columns
         missing_columns = []
-        for col in ['risk_percent', 'max_drawdown', 'max_open_trades']:
-            if col not in columns:
-                missing_columns.append(col)
+        for col_name, col_type in risk_columns.items():
+            if col_name.lower() not in columns:
+                missing_columns.append((col_name, col_type))
         
         if missing_columns:
-            for col in missing_columns:
-                db.execute_sql(f"ALTER TABLE users ADD {col} NVARCHAR(50)")
+            logger.info(f"Adding missing risk columns: {[col[0] for col in missing_columns]}")
+            for col_name, col_type in missing_columns:
+                try:
+                    alter_sql = f"ALTER TABLE users ADD {col_name} {col_type}"
+                    logger.info(f"Executing: {alter_sql}")
+                    db.execute_sql(alter_sql)
+                    logger.info(f"Successfully added column: {col_name}")
+                except Exception as alter_e:
+                    logger.error(f"Failed to add column {col_name}: {str(alter_e)}")
+                    return False
         
-        # Update the risk settings
-        result = db.execute_sql(
-            """UPDATE users 
-               SET risk_percent = ?, max_drawdown = ?, max_open_trades = ? 
-               WHERE email = ?""",
-            (str(risk_percent), str(max_drawdown), str(max_open_trades), email)
-        )
+        # Execute the update
+        update_sql = """UPDATE users 
+                       SET risk_percent = ?, max_drawdown = ?, max_open_trades = ? 
+                       WHERE email = ?"""
         
-        # Check if the update was successful (rowcount property might not be directly accessible)
-        check_result = db.read_sql_query(
-            "SELECT COUNT(*) AS row_count FROM users WHERE email = ?", 
-            (email,)
-        )
+        params = (float(risk_percent), float(max_drawdown), int(max_open_trades), str(email))
+        logger.info(f"Update SQL: {update_sql}")
+        logger.info(f"Parameters: {params}")
+        logger.info(f"Parameter types: {[type(p).__name__ for p in params]}")
         
-        if check_result.iloc[0]['row_count'] > 0:
-            logger.info(f"Updated risk settings for user {email}")
-            return True
-        else:
-            logger.warning(f"No user found with email {email} for risk settings update")
+        try:
+            logger.info("Executing update query...")
+            update_result = db.execute_sql(update_sql, params=params)
+            logger.info(f"Update executed successfully, affected rows: {update_result.rowcount}")
+        except Exception as update_error:
+            logger.error(f"Update execution failed: {str(update_error)}")
             return False
+        
+        # Verify the update was successful
+        logger.info("Verifying update...")
+        try:
+            verification = db.read_sql_query(
+                """SELECT risk_percent, max_drawdown, max_open_trades 
+                   FROM users WHERE email = ?""", 
+                params=(email,)
+            )
+            
+            if not verification.empty:
+                updated_risk = float(verification.iloc[0]['risk_percent'])
+                updated_drawdown = float(verification.iloc[0]['max_drawdown'])
+                updated_trades = int(verification.iloc[0]['max_open_trades'])
+                
+                logger.info(f"Verification - DB values: risk={updated_risk}, drawdown={updated_drawdown}, trades={updated_trades}")
+                logger.info(f"Verification - Expected: risk={risk_percent}, drawdown={max_drawdown}, trades={max_open_trades}")
+                
+                if (abs(updated_risk - risk_percent) < 0.000001 and 
+                    abs(updated_drawdown - max_drawdown) < 0.000001 and 
+                    updated_trades == max_open_trades):
+                    
+                    logger.info(f"Successfully updated and verified risk settings for user {email}")
+                    return True
+                else:
+                    logger.error(f"Risk settings update verification failed for user {email}")
+                    return False
+            else:
+                logger.error(f"Could not verify risk settings update for user {email} - no data returned")
+                return False
+                
+        except Exception as verify_error:
+            logger.error(f"Verification query failed: {str(verify_error)}")
+            logger.warning("Returning True despite verification failure - update may have succeeded")
+            return True
+            
     except Exception as e:
-        logger.error(f"Error updating risk settings for {email}: {str(e)}")
+        logger.error(f"Unexpected error updating risk settings for {email}: {str(e)}")
+        logger.exception("Full error traceback:")
         return False
+    finally:
+        if db:
+            try:
+                db.close()
+                logger.info("Database connection closed")
+            except Exception as close_error:
+                logger.error(f"Error closing database connection: {str(close_error)}")
 
 def get_backtest_history(email):
     """Get user's backtest history."""

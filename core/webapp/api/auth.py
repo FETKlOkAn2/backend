@@ -6,6 +6,7 @@ import hashlib
 import base64
 from flask_cors import cross_origin
 import dotenv
+from core import database_interaction
 
 dotenv.load_dotenv(override=True)
 
@@ -112,6 +113,8 @@ def proxy_signup():
             if not gender: missing_fields.append("gender")
             if not locale: missing_fields.append("locale")
             
+            print(f"Missing fields: {missing_fields}")
+            current_app.logger.error(f"Missing required fields: {', '.join(missing_fields)}")
             return jsonify({
                 "status": "error", 
                 "message": f"Missing required fields: {', '.join(missing_fields)}"
@@ -166,6 +169,22 @@ def proxy_signup():
         
         # Attempt user registration with Cognito
         response = client.sign_up(**signup_params)
+        current_app.logger.info(f"User {email} registered successfully in Cognito.")
+
+        # Save user to database - separate try/catch for database errors
+        try:
+            database_interaction.save_user(email)
+            print(f"User {email} registered successfully in the database.")
+            current_app.logger.info(f"User {email} saved to database successfully.")
+        except Exception as db_error:
+            current_app.logger.error(f"Database error for user {email}: {str(db_error)}")
+            # You might want to decide whether to return success or error here
+            # Since Cognito registration succeeded but DB failed
+            return jsonify({
+                "status": "warning",
+                "message": "User registered in Cognito but database save failed. Please contact support.",
+                "userSub": response.get('UserSub')
+            }), 201
         
         # Return registration result to the client
         return jsonify({

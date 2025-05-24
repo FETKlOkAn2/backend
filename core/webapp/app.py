@@ -9,8 +9,9 @@ from flask_socketio import SocketIO
 
 from core.webapp.config import Config
 from core.webapp.api.auth import auth_bp
-from core.webapp.api.backtest import backtest_bp
-from core.webapp.api.trading import trading_bp
+from core.webapp.api.backtest_bp import backtest_bp
+from core.webapp.api.trading_bp import trading_bp
+from core.webapp.api.risk_bp import risk_bp
 from core.webapp.websockets.handlers import register_socket_handlers
 
 import ssl
@@ -80,6 +81,7 @@ def create_app(config_class=Config):
     app.register_blueprint(auth_bp, url_prefix='/api')
     app.register_blueprint(backtest_bp, url_prefix='/api')
     app.register_blueprint(trading_bp, url_prefix='/api')
+    app.register_blueprint(risk_bp, url_prefix='/api')
     
     # Configure error handlers
     @app.errorhandler(Exception)
