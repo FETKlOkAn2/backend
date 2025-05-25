@@ -102,51 +102,36 @@ def proxy_signup():
         gender = data.get('gender')
         locale = data.get('locale')
         
+    
         # Validate inputs
-        if not username or not password or not email or not name or not birthdate or not gender or not locale:
-            missing_fields = []
-            if not username: missing_fields.append("username")
-            if not password: missing_fields.append("password")
-            if not email: missing_fields.append("email")
-            if not name: missing_fields.append("name")
-            if not birthdate: missing_fields.append("birthdate")
-            if not gender: missing_fields.append("gender")
-            if not locale: missing_fields.append("locale")
-            
-            print(f"Missing fields: {missing_fields}")
+        missing_fields = [f for f in ['username', 'password', 'email', 'name', 'birthdate', 'gender', 'locale'] if not data.get(f)]
+        if missing_fields:
             current_app.logger.error(f"Missing required fields: {', '.join(missing_fields)}")
             return jsonify({
                 "status": "error", 
                 "message": f"Missing required fields: {', '.join(missing_fields)}"
             }), 400
-        
+
         dotenv.load_dotenv(override=True)
-        # Get Cognito credentials from environment variables
         client_id = os.getenv('COGNITO_APP_CLIENT_ID')
         client_secret = os.getenv('COGNITO_APP_CLIENT_SECRET')
+        region = os.getenv('AWS_REGION', 'eu-north-1')
         
         if not client_id or not client_secret:
             current_app.logger.error("Missing Cognito credentials in environment variables")
             return jsonify({"status": "error", "message": "Server configuration error"}), 500
-        
-        # Create Cognito client
-        client = boto3.client(
-            'cognito-idp',
-            region_name=os.getenv('AWS_REGION', 'eu-north-1')
-        )
-        
-        # Calculate SECRET_HASH (only if client secret is provided)
-        secret_hash = None
-        if client_secret:
-            message = username + client_id
-            dig = hmac.new(
-                client_secret.encode('utf-8'),
-                msg=message.encode('utf-8'),
-                digestmod=hashlib.sha256
-            ).digest()
-            secret_hash = base64.b64encode(dig).decode()
-        
-        # Prepare user attributes
+
+        client = boto3.client('cognito-idp', region_name=region)
+
+        if check_user_exists(email, client):
+            return jsonify({"status": "error", "message": "User with this email already exists"}), 400  
+        # Generate secret hash
+        secret_hash = base64.b64encode(hmac.new(
+            client_secret.encode('utf-8'),
+            msg=(username + client_id).encode('utf-8'),
+            digestmod=hashlib.sha256
+        ).digest()).decode()
+
         user_attributes = [
             {'Name': 'email', 'Value': email},
             {'Name': 'name', 'Value': name},
@@ -154,57 +139,61 @@ def proxy_signup():
             {'Name': 'gender', 'Value': gender},
             {'Name': 'locale', 'Value': locale}
         ]
-        
-        # Prepare sign_up params
+
         signup_params = {
             'ClientId': client_id,
             'Username': username,
             'Password': password,
-            'UserAttributes': user_attributes
+            'UserAttributes': user_attributes,
+            'SecretHash': secret_hash
         }
-        
-        # Add SecretHash if available
-        if secret_hash:
-            signup_params['SecretHash'] = secret_hash
-        
-        # Attempt user registration with Cognito
-        response = client.sign_up(**signup_params)
-        current_app.logger.info(f"User {email} registered successfully in Cognito.")
 
-        # Save user to database - separate try/catch for database errors
+        # FIRST: Attempt Cognito sign-up
+        try:
+            response = client.sign_up(**signup_params)
+            current_app.logger.info(f"User {email} registered successfully in Cognito.")
+        except client.exceptions.UsernameExistsException:
+            return jsonify({"status": "error", "message": "User already exists"}), 400
+        except client.exceptions.InvalidPasswordException as e:
+            return jsonify({"status": "error", "message": str(e)}), 400
+        except client.exceptions.InvalidParameterException as e:
+            return jsonify({"status": "error", "message": f"Invalid parameter: {str(e)}"}), 400
+        except Exception as e:
+            current_app.logger.error(f"Error registering user in Cognito: {str(e)}")
+            return jsonify({"status": "error", "message": f"Cognito sign-up failed: {str(e)}"}), 500
+
+        # THEN: Save to database
         try:
             database_interaction.save_user(email)
-            print(f"User {email} registered successfully in the database.")
             current_app.logger.info(f"User {email} saved to database successfully.")
-        except Exception as db_error:
-            current_app.logger.error(f"Database error for user {email}: {str(db_error)}")
-            # You might want to decide whether to return success or error here
-            # Since Cognito registration succeeded but DB failed
-            return jsonify({
-                "status": "warning",
-                "message": "User registered in Cognito but database save failed. Please contact support.",
-                "userSub": response.get('UserSub')
-            }), 201
-        
-        # Return registration result to the client
+        except Exception as e:
+            current_app.logger.error(f"Error saving user {email} to database: {str(e)}")
+            # Consider rolling back Cognito user (e.g., admin_delete_user if email verification not yet done)
+            return jsonify({"status": "error", "message": f"Database error: {str(e)}"}), 500
+
         return jsonify({
             "status": "success",
             "message": "User registration successful. Verification code sent to email.",
             "userSub": response.get('UserSub')
         })
-        
-    except client.exceptions.UsernameExistsException:
-        return jsonify({"status": "error", "message": "User already exists"}), 400
-    
-    except client.exceptions.InvalidPasswordException as e:
-        return jsonify({"status": "error", "message": str(e)}), 400
-    
-    except client.exceptions.InvalidParameterException as e:
-        return jsonify({"status": "error", "message": f"Invalid parameter: {str(e)}"}), 400
-    
+
     except Exception as e:
-        current_app.logger.error(f"Registration error: {str(e)}")
+        current_app.logger.error(f"Unexpected registration error: {str(e)}")
         return jsonify({"status": "error", "message": str(e)}), 500
+    
+def check_user_exists(email, client):
+    """Check if user with email already exists"""
+    try:
+        response = client.admin_get_user(
+            UserPoolId=os.getenv('COGNITO_USER_POOL_ID'),
+            Username=email  # or however you want to search
+        )
+        return True
+    except client.exceptions.UserNotFoundException:
+        return False
+    except Exception:
+        # If we can't check, assume it might exist
+        return True
 
 @auth_bp.route('/proxy/confirm-signup', methods=['POST'])
 @cross_origin(supports_credentials=True)

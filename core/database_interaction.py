@@ -1984,6 +1984,7 @@ def save_user(email, privacy_policy_accepted=False, api_key=None,
             )"""
         )
         
+        logger.info(f"(Creating new table USERS) : Executing query for user {email} with default risk settings")
         current_time = datetime.datetime.now().isoformat()
         
         # Insert new user with proper parameter binding
