@@ -22,8 +22,8 @@ class Coinbase_Wrapper():
         self.socketio = socketio
 
         self.db_path = os.getenv('DATABASE_PATH', 'database')  # Default to 'database' if not set
-        self.api_key = os.getenv('DOTENV_API_KEY_COINBASE')
-        self.api_secret = os.getenv('DOTENV_API_PRIVATE_KEY_COINBASE')
+        self.api_key = os.getenv('API_KEY_COINBASE')
+        self.api_secret = os.getenv('API_PRIVATE_KEY_COINBASE')
 
         print("DATABASE_PATH:", self.db_path)
         print("API KEY COINBASE:", self.api_key)
@@ -482,5 +482,5 @@ granularity = 'ONE_MINUTE'
 coinbase.get_candles_for_db(
     symbols=coinbase.coinbase_robin_crypto,
     granularity=granularity,
-    days=700
+    days=200
     )
