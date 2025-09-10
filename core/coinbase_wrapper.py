@@ -21,7 +21,7 @@ class Coinbase_Wrapper():
         
         self.socketio = socketio
 
-        self.db_path = os.getenv('DATABASE_PATH', 'database')  # Default to 'database' if not set
+        self.db_path = os.getenv('DATABASE_PATH', 'E:/database')  # Default to 'database' if not set
         self.api_key = os.getenv('API_KEY_COINBASE')
         self.api_secret = os.getenv('API_PRIVATE_KEY_COINBASE')
 
@@ -101,8 +101,10 @@ class Coinbase_Wrapper():
     def _get_data_from_db(self, symbol, granularity):
         """Retrieve existing data for a symbol from the database."""
         conn = sql.connect(f'{self.db_path}/{granularity}.db')
+        print(f"Connected to database: {self.db_path}/{granularity}.db to fetch data for {symbol}")
         cursor = conn.cursor()
         symbol_for_table = symbol.replace('-', '_')
+        print(f"Looking for tables matching: {symbol_for_table}_%")
         # Get the list of tables that contain the symbol
         cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?", (f'{symbol_for_table}_%',))
         tables = cursor.fetchall()
@@ -120,12 +122,12 @@ class Coinbase_Wrapper():
         return combined_df
 
     def _fetch_data(self, symbol, start_unix, end_unix, granularity):
-        max_retries = 4
+        # max_retries = 4
         
         # Convert Unix timestamps to readable dates for better debugging
-        start_date = dt.datetime.fromtimestamp(start_unix)
-        end_date = dt.datetime.fromtimestamp(end_unix)
-        print(f"Attempting to fetch {symbol} data from {start_date} to {end_date}")
+        # start_date = dt.datetime.fromtimestamp(start_unix)
+        # end_date = dt.datetime.fromtimestamp(end_unix)
+        # print(f"Attempting to fetch {symbol} data from {start_date} to {end_date}")
         
         for attempt in range(10):
             try:
@@ -137,16 +139,16 @@ class Coinbase_Wrapper():
                 )
                 
                 # Debug the response structure
-                print(f"Response type: {type(response)}")
-                if hasattr(response, 'candles'):
-                    print(f"Number of candles: {len(response.candles)}")
-                    if response.candles:
+                # print(f"Response type: {type(response)}")
+                # if hasattr(response, 'candles'):
+                #     print(f"Number of candles: {len(response.candles)}")
+                #     if response.candles:
                         # Print the first candle to see its structure
-                        print(f"First candle structure: {type(response.candles[0])}")
-                        print(f"First candle data: {response.candles[0]}")
-                else:
-                    print("Response has no 'candles' attribute")
-                    print(f"Response attributes: {dir(response)}")
+                        # print(f"First candle structure: {type(response.candles[0])}")
+                        # print(f"First candle data: {response.candles[0]}")
+                # else:
+                #     print("Response has no 'candles' attribute")
+                #     print(f"Response attributes: {dir(response)}")
                 
                 # Now let's create a DataFrame directly from the response
                 if hasattr(response, 'candles') and response.candles:
@@ -179,7 +181,7 @@ class Coinbase_Wrapper():
                         # Fill forward any missing values
                         df = df.ffill()
                         
-                        print(f"Successfully created DataFrame with {len(df)} rows")
+                        # print(f"Successfully created DataFrame with {len(df)} rows")
                         return df
                     else:
                         print(f"No data found for {symbol} in time range")
@@ -297,21 +299,22 @@ class Coinbase_Wrapper():
                 # Print human-readable dates for debugging
                 start_date = dt.datetime.fromtimestamp(start_unix)
                 end_date = dt.datetime.fromtimestamp(end_unix)
-                print(f"Fetching range {i+1}/{len(missing_date_ranges)}: {start_date} to {end_date}")
+                # print(f"Fetching range {i+1}/{len(missing_date_ranges)}: {start_date} to {end_date}")
                 
                 # Fetch the data
                 df = self._fetch_data(symbol, start_unix, end_unix, granularity)
 
                 if not df.empty:
-                    rows_fetched = len(df)
+                    # rows_fetched = len(df)
                     # print(f"Fetched {rows_fetched} rows for {symbol}")
-                    data_found = True
+                    
                     combined_df = pd.concat([combined_df, df], ignore_index=True)
+                    data_found = True
                 else:
                     print(f"No data found for {symbol} in time range")
 
                 # Update progress
-                utils.progress_bar_with_eta(i, missing_date_ranges, start_time, self.socketio, symbol)
+                utils.progress_bar_with_eta(i, missing_date_ranges, start_time, self.socketio, symbol, start_date, end_date)
                 percent = int(((i + 1) / len(missing_date_ranges)) * 100)
                 eta = (time.time() - start_time) / (i + 1) * (len(missing_date_ranges) - (i + 1))
                 eta_minutes, eta_seconds = divmod(int(eta), 60)
@@ -482,5 +485,5 @@ granularity = 'ONE_MINUTE'
 coinbase.get_candles_for_db(
     symbols=coinbase.coinbase_robin_crypto,
     granularity=granularity,
-    days=200
+    days=360
     )

@@ -193,10 +193,29 @@ class MSSQLDatabase:
             logger.error(f"Error occurred while creating table {table_name}: {e}")
 
 def get_historical_from_db(granularity, symbols: list = [], num_days: int = None, convert=False, db_type="sqlite"):
+    """
+    Retrieve historical data from database with improved error handling and performance.
+    
+    Args:
+        granularity (str): The granularity/database name
+        symbols (list): List of symbols to retrieve (empty list means all)
+        num_days (int): Number of days to retrieve from the most recent date
+        convert (bool): Whether to convert symbols using utils.convert_symbols
+        db_type (str): Database type ('sqlite', 'mssql', 'postgresql')
+    
+    Returns:
+        dict: Dictionary with symbol names as keys and DataFrames as values
+    """
     original_symbol = symbols
 
     if convert:
-        symbols = utils.convert_symbols(lone_symbol=symbols)
+        try:
+            import utils
+            symbols = utils.convert_symbols(lone_symbol=symbols)
+        except ImportError:
+            logger.warning("utils module not found, skipping symbol conversion")
+        except Exception as e:
+            logger.warning(f"Error converting symbols: {e}")
 
     # Database file naming based on type
     if db_type == "sqlite":
@@ -207,34 +226,62 @@ def get_historical_from_db(granularity, symbols: list = [], num_days: int = None
     db = FlexibleDatabase(db_file, db_type)
 
     try:
-        # Query for table names based on database type
-        if db.db_type == "sqlite":
-            query = "SELECT name as TABLE_NAME FROM sqlite_master WHERE type='table'"
-        else:
-            query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'"
-            
-        tables = db.read_sql_query(query)
+        # Get all tables in the database
+        tables = db.get_table_names()
         tables_data = {}
         
         logger.info(f"Found {len(tables)} tables in {granularity}")
         
-        if tables.empty:
+        if not tables:
             logger.warning(f"No tables found in {granularity}")
             return {}
         
-        for table in tables['TABLE_NAME']:
+        # Filter tables based on symbols if provided
+        tables_to_process = []
+        for table in tables:
+            # Extract symbol from table name (assuming format like 'BTC-USD_1m' or 'BTC_USD_1m')
             clean_table_name = '-'.join(table.split('_')[:2])
-            
-            # If symbols are provided, skip tables that are not in the symbol list
-            if symbols and clean_table_name not in symbols:
-                continue
-
+            if not symbols or clean_table_name in symbols:
+                tables_to_process.append((table, clean_table_name))
+        
+        if not tables_to_process:
+            logger.warning(f"No matching tables found for symbols: {symbols}")
+            return {}
+        
+        logger.info(f"Processing {len(tables_to_process)} tables")
+        
+        for table, clean_table_name in tables_to_process:
             try:
                 # Retrieve data from the table - use appropriate quoting for each DB type
                 if db.db_type == "sqlite":
-                    query_data = f'SELECT * FROM "{table}"'
-                else:
-                    query_data = f'SELECT * FROM [{table}]'  # MSSQL bracket notation
+                    query_data = f'SELECT * FROM "{table}" ORDER BY date DESC'
+                elif db.db_type == "mssql":
+                    query_data = f'SELECT * FROM [{table}] ORDER BY date DESC'
+                else:  # PostgreSQL
+                    query_data = f'SELECT * FROM "{table}" ORDER BY date DESC'
+                
+                # Add LIMIT if num_days is specified and we can calculate approximate rows needed
+                if num_days is not None and granularity:
+                    # Rough estimation of rows per day based on granularity
+                    rows_per_day_map = {
+                        'ONE_MINUTE': 1440,  # 24*60
+                        'FIVE_MINUTE': 288,  # 24*60/5
+                        'FIFTEEN_MINUTE': 96,  # 24*60/15
+                        'THIRTY_MINUTE': 48,  # 24*60/30
+                        'ONE_HOUR': 24,
+                        'TWO_HOUR': 12,
+                        'SIX_HOUR': 4,
+                        'ONE_DAY': 1
+                    }
+                    
+                    estimated_rows = rows_per_day_map.get(granularity.upper(), 1440) * num_days
+                    
+                    if db.db_type == "sqlite":
+                        query_data += f' LIMIT {estimated_rows * 2}'  # Get extra for safety
+                    elif db.db_type == "mssql":
+                        query_data = query_data.replace('SELECT *', f'SELECT TOP {estimated_rows * 2} *')
+                    else:  # PostgreSQL
+                        query_data += f' LIMIT {estimated_rows * 2}'
                     
                 data = db.read_sql_query(query_data)
                 
@@ -244,31 +291,42 @@ def get_historical_from_db(granularity, symbols: list = [], num_days: int = None
                     
                 logger.info(f"Retrieved {len(data)} rows from table {table}")
                 
-                # Handle date column - might be named differently or need different parsing
-                date_columns = ['date', 'timestamp', 'datetime']
+                # Handle date column - look for common date column names
+                date_columns = ['date', 'timestamp', 'datetime', 'time']
                 date_col = None
                 for col in date_columns:
-                    if col in data.columns:
-                        date_col = col
+                    if col.lower() in [c.lower() for c in data.columns]:
+                        # Find the actual column name (case-sensitive)
+                        date_col = next(c for c in data.columns if c.lower() == col.lower())
                         break
                 
                 if date_col:
                     data[date_col] = pd.to_datetime(data[date_col], errors='coerce')
+                    data = data.dropna(subset=[date_col])  # Remove rows with invalid dates
                     data.set_index(date_col, inplace=True)
                 else:
-                    # If no date column found, assume index is already datetime
+                    # If no date column found, try to convert index
                     if not isinstance(data.index, pd.DatetimeIndex):
                         logger.warning(f"No date column found in table {table}, attempting to convert index")
-                        data.index = pd.to_datetime(data.index, errors='coerce')
+                        try:
+                            data.index = pd.to_datetime(data.index, errors='coerce')
+                            data = data.dropna()  # Remove rows with invalid index dates
+                        except Exception as e:
+                            logger.error(f"Could not convert index to datetime for table {table}: {e}")
+                            continue
 
+                # Sort by date (most recent first, then reverse for chronological order)
+                data = data.sort_index()
+                
+                # Apply date filtering if specified
                 if num_days is not None:
-                    last_date = data.index.max()  # Find the most recent date in the dataset
+                    last_date = data.index.max()
                     start_date = last_date - pd.Timedelta(days=num_days)
                     data = data.loc[data.index >= start_date]
                     logger.info(f"Filtered data to last {num_days} days, now have {len(data)} rows")
 
                 # Store the data in the dictionary
-                if convert:
+                if convert and original_symbol:
                     tables_data[original_symbol] = data
                 else:
                     tables_data[clean_table_name] = data
@@ -289,7 +347,12 @@ def get_historical_from_db(granularity, symbols: list = [], num_days: int = None
     except Exception as e:
         logger.error(f"Error in get_historical_from_db: {str(e)}")
         return {}
-
+    finally:
+        # Always close the database connection
+        try:
+            db.close()
+        except:
+            pass
 
 def get_best_params(strategy_object, df_manager=None, live_trading=False, best_of_all_granularities=False, minimum_trades=None, with_lowest_losing_average=False):
     granularities = ['ONE_MINUTE', 'FIVE_MINUTE', 'FIFTEEN_MINUTE', 'THIRTY_MINUTE', 'ONE_HOUR', 'TWO_HOUR', 'SIX_HOUR', 'ONE_DAY']
@@ -558,43 +621,90 @@ def export_hyper_to_db(strategy: object, hyper: object):
 
     return
 
-def export_historical_to_db(dict_df, granularity, db_type="sqlite"):
-    db = FlexibleDatabase(f'{granularity}.db' if db_type == "sqlite" else granularity, db_type)
-    
-    for symbol, df in dict_df.items():
-        # Replace hyphens with underscores in symbol
-        symbol_pattern = symbol.replace('-', '_')
-        # Construct the new table name with the updated date range.
-        first_date = df.index[0].date()
-        last_date = df.index[-1].date()
-        new_table_name = f'{symbol_pattern}_{first_date}_TO_{last_date}'.replace('-', '_')
-        
-        # Get existing tables based on database type
-        if db.db_type == "sqlite":
-            # SQLite query for table names
-            query = "SELECT name as TABLE_NAME FROM sqlite_master WHERE type='table' AND name LIKE ?"
-            symbol_pattern_like = f'{symbol_pattern}_%'
-            existing_tables = db.read_sql_query(query, params=[symbol_pattern_like])
-        else:
-            # MSSQL query (your original)
-            symbol_pattern_escaped = symbol_pattern.replace('_', r'\_')
-            pattern = f'{symbol_pattern_escaped}\\_%'
-            query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME LIKE ? ESCAPE '\\'"
-            existing_tables = db.read_sql_query(query, params=[pattern])
-        
-        # Drop all existing tables that match the pattern
-        if not existing_tables.empty:
-            for existing_table in existing_tables['TABLE_NAME']:
-                if db.db_type == "sqlite":
-                    drop_table_query = f'DROP TABLE IF EXISTS "{existing_table}"'
-                else:
-                    drop_table_query = f'DROP TABLE IF EXISTS [{existing_table}]'  # MSSQL bracket notation
-                db.execute_sql(drop_table_query)
-        
-        # Write the DataFrame to the new table
-        df.drop_duplicates(subset=None, keep='first', inplace=True, ignore_index=False)
-        db.to_sql(df, new_table_name, if_exists='replace', index=True)
-    return
+import os
+import sqlite3
+import re
+import pandas as pd
+
+def export_historical_to_db(data_dict, granularity, db_type="sqlite"):
+    """
+    Export historical data to database, automatically updating the table name
+    when new data extends the end date.
+    """
+
+    if db_type == "sqlite":
+        db_file = f'{granularity}.db'
+    else:
+        db_file = granularity
+
+    db = FlexibleDatabase(db_file, db_type)
+
+    try:
+        for symbol, df in data_dict.items():
+            if df.empty:
+                logger.warning(f"Skipping empty DataFrame for symbol {symbol}")
+                continue
+
+            conn = sqlite3.connect(db_file)
+            cursor = conn.cursor()
+
+            # Nájdeme všetky tabuľky pre tento symbol
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name LIKE ?", (f"{symbol.replace('-', '_')}%",))
+            tables = [row[0] for row in cursor.fetchall()]
+
+            # Najstarší a najnovší dátum z nového DF
+            new_start = df.index.min().strftime("%Y_%m_%d")
+            new_end = df.index.max().strftime("%Y_%m_%d")
+
+            # Ak ešte tabuľka neexistuje → vytvoríme ju
+            if not tables:
+                table_name = f"{symbol.replace('-', '_')}_{new_start}_TO_{new_end}"
+                db.to_sql(df, table_name, if_exists='fail', index=True, chunksize=1000)
+                logger.info(f"Created new table {table_name} with {len(df)} rows")
+                conn.close()
+                continue
+
+            # Použijeme prvú tabuľku (mala by byť len jedna)
+            old_table = tables[0]
+
+            # Extrahujeme dátumy zo starého názvu
+            match = re.search(rf"{symbol.replace('-', '_')}_([0-9_]+)_TO_([0-9_]+)", old_table)
+            if match:
+                old_start = match.group(1)
+                old_end = match.group(2)
+            else:
+                logger.error(f"Cannot parse dates from table name {old_table}")
+                conn.close()
+                continue
+
+            # Vypočítame nové hranice dátumu
+            final_start = min(pd.to_datetime(old_start, format="%Y_%m_%d"), pd.to_datetime(new_start, format="%Y_%m_%d")).strftime("%Y_%m_%d")
+            final_end = max(pd.to_datetime(old_end, format="%Y_%m_%d"), pd.to_datetime(new_end, format="%Y_%m_%d")).strftime("%Y_%m_%d")
+
+            # Vytvoríme nový názov tabuľky
+            new_table = f"{symbol.replace('-', '_')}_{final_start}_TO_{final_end}"
+
+            # Ak je názov iný → premenujeme tabuľku
+            if new_table != old_table:
+                cursor.execute(f"ALTER TABLE '{old_table}' RENAME TO '{new_table}'")
+                conn.commit()
+                logger.info(f"Renamed table {old_table} → {new_table}")
+
+            conn.close()
+
+            # Teraz appendneme nové dáta
+            db.to_sql(df, new_table, if_exists='append', index=True, chunksize=1000)
+            logger.info(f"Appended {len(df)} rows to table {new_table}")
+
+    except Exception as e:
+        logger.error(f"Error in export_historical_to_db: {e}")
+        raise
+    finally:
+        try:
+            db.close()
+        except:
+            pass
+
 
 def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None, socketio=None, db_type="sqlite"):
     """
@@ -616,12 +726,13 @@ def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None, socketio
 
     dict_df = get_historical_from_db(granularity=granularity, db_type=db_type)
 
-    resampled_dict_df = {}
     start_time = time.time()
     for i, key in enumerate(times_to_resample.keys()):
         value = times_to_resample[key]
+        resampled_dict_df = {}  # Move this inside the loop
+        
         for symbol, df in dict_df.items():
-            print(symbol, df)
+            print(f"Processing {symbol} with {len(df)} rows")
             df = df.sort_index()
 
             df_resampled = df.resample(value).agg({
@@ -633,15 +744,15 @@ def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None, socketio
             })
 
             df_resampled.dropna(inplace=True)
-
             resampled_dict_df[symbol] = df_resampled
         
+        # Use the improved export function
         export_historical_to_db(resampled_dict_df, granularity=key, db_type=db_type)
 
-        # Assuming utils module exists
-        utils.progress_bar_with_eta(i, data=times_to_resample.keys(), start_time=start_time, 
-                                  socketio=socketio, symbol=key, socket_invoker="resampling_progress")
-
+        # Progress tracking
+        if hasattr(utils, 'progress_bar_with_eta'):
+            utils.progress_bar_with_eta(i, data=times_to_resample.keys(), start_time=start_time, 
+                                      socketio=socketio, symbol=key, socket_invoker="resampling_progress")
 
 
 
