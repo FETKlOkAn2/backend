@@ -24,6 +24,7 @@ import secrets
 import hashlib
 from typing import Dict, List, Optional, Any, Tuple, Union
 import uuid
+from core.flexible_db import FlexibleDatabase  # Assuming the class is in flexible_db.py
 
 from core.utils.encryption_utils import encrypt_api_key, decrypt_api_key
 from core.utils.api_key_tester import ApiKeyTester
@@ -191,17 +192,27 @@ class MSSQLDatabase:
         except Exception as e:
             logger.error(f"Error occurred while creating table {table_name}: {e}")
 
-def get_historical_from_db(granularity, symbols: list = [], num_days: int = None, convert=False):
+def get_historical_from_db(granularity, symbols: list = [], num_days: int = None, convert=False, db_type="sqlite"):
     original_symbol = symbols
 
     if convert:
         symbols = utils.convert_symbols(lone_symbol=symbols)
 
-    db_file = f'{granularity}'
-    db = MSSQLDatabase(db_file)
+    # Database file naming based on type
+    if db_type == "sqlite":
+        db_file = f'{granularity}.db'
+    else:
+        db_file = granularity
+        
+    db = FlexibleDatabase(db_file, db_type)
 
     try:
-        query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE';"
+        # Query for table names based on database type
+        if db.db_type == "sqlite":
+            query = "SELECT name as TABLE_NAME FROM sqlite_master WHERE type='table'"
+        else:
+            query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE'"
+            
         tables = db.read_sql_query(query)
         tables_data = {}
         
@@ -219,8 +230,13 @@ def get_historical_from_db(granularity, symbols: list = [], num_days: int = None
                 continue
 
             try:
-                # Retrieve data from the table
-                data = db.read_sql_query(f'SELECT * FROM "{table}"')
+                # Retrieve data from the table - use appropriate quoting for each DB type
+                if db.db_type == "sqlite":
+                    query_data = f'SELECT * FROM "{table}"'
+                else:
+                    query_data = f'SELECT * FROM [{table}]'  # MSSQL bracket notation
+                    
+                data = db.read_sql_query(query_data)
                 
                 if data.empty:
                     logger.warning(f"Table {table} is empty!")
@@ -228,8 +244,22 @@ def get_historical_from_db(granularity, symbols: list = [], num_days: int = None
                     
                 logger.info(f"Retrieved {len(data)} rows from table {table}")
                 
-                data['date'] = pd.to_datetime(data['date'], errors='coerce')
-                data.set_index('date', inplace=True)
+                # Handle date column - might be named differently or need different parsing
+                date_columns = ['date', 'timestamp', 'datetime']
+                date_col = None
+                for col in date_columns:
+                    if col in data.columns:
+                        date_col = col
+                        break
+                
+                if date_col:
+                    data[date_col] = pd.to_datetime(data[date_col], errors='coerce')
+                    data.set_index(date_col, inplace=True)
+                else:
+                    # If no date column found, assume index is already datetime
+                    if not isinstance(data.index, pd.DatetimeIndex):
+                        logger.warning(f"No date column found in table {table}, attempting to convert index")
+                        data.index = pd.to_datetime(data.index, errors='coerce')
 
                 if num_days is not None:
                     last_date = data.index.max()  # Find the most recent date in the dataset
@@ -528,8 +558,8 @@ def export_hyper_to_db(strategy: object, hyper: object):
 
     return
 
-def export_historical_to_db(dict_df, granularity):
-    db = MSSQLDatabase(f'{granularity}')
+def export_historical_to_db(dict_df, granularity, db_type="sqlite"):
+    db = FlexibleDatabase(f'{granularity}.db' if db_type == "sqlite" else granularity, db_type)
     
     for symbol, df in dict_df.items():
         # Replace hyphens with underscores in symbol
@@ -539,26 +569,34 @@ def export_historical_to_db(dict_df, granularity):
         last_date = df.index[-1].date()
         new_table_name = f'{symbol_pattern}_{first_date}_TO_{last_date}'.replace('-', '_')
         
-        # Escape underscores in the symbol pattern for the LIKE query
-        symbol_pattern_escaped = symbol_pattern.replace('_', r'\_')
-        pattern = f'{symbol_pattern_escaped}\\_%'
-        
-        # Fetch all existing tables matching the pattern
-        query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME LIKE ? ESCAPE '\\'"
-        existing_tables = db.read_sql_query(query, params={'pattern': pattern})
+        # Get existing tables based on database type
+        if db.db_type == "sqlite":
+            # SQLite query for table names
+            query = "SELECT name as TABLE_NAME FROM sqlite_master WHERE type='table' AND name LIKE ?"
+            symbol_pattern_like = f'{symbol_pattern}_%'
+            existing_tables = db.read_sql_query(query, params=[symbol_pattern_like])
+        else:
+            # MSSQL query (your original)
+            symbol_pattern_escaped = symbol_pattern.replace('_', r'\_')
+            pattern = f'{symbol_pattern_escaped}\\_%'
+            query = "SELECT TABLE_NAME FROM INFORMATION_SCHEMA.TABLES WHERE TABLE_TYPE = 'BASE TABLE' AND TABLE_NAME LIKE ? ESCAPE '\\'"
+            existing_tables = db.read_sql_query(query, params=[pattern])
         
         # Drop all existing tables that match the pattern
-        for existing_table in existing_tables['TABLE_NAME']:
-            drop_table_query = f'DROP TABLE IF EXISTS \"{existing_table}\"'
-            db.execute_sql(drop_table_query)
+        if not existing_tables.empty:
+            for existing_table in existing_tables['TABLE_NAME']:
+                if db.db_type == "sqlite":
+                    drop_table_query = f'DROP TABLE IF EXISTS "{existing_table}"'
+                else:
+                    drop_table_query = f'DROP TABLE IF EXISTS [{existing_table}]'  # MSSQL bracket notation
+                db.execute_sql(drop_table_query)
         
         # Write the DataFrame to the new table
         df.drop_duplicates(subset=None, keep='first', inplace=True, ignore_index=False)
         db.to_sql(df, new_table_name, if_exists='replace', index=True)
     return
 
-
-def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None, socketio=None):
+def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None, socketio=None, db_type="sqlite"):
     """
     Resamples data from the database for different timeframes based on the granularity.
     """
@@ -576,7 +614,7 @@ def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None, socketio
         'ONE_DAY': '1d'
     }
 
-    dict_df = get_historical_from_db(granularity=granularity)
+    dict_df = get_historical_from_db(granularity=granularity, db_type=db_type)
 
     resampled_dict_df = {}
     start_time = time.time()
@@ -598,11 +636,11 @@ def resample_dataframe_from_db(granularity='ONE_MINUTE', callback=None, socketio
 
             resampled_dict_df[symbol] = df_resampled
         
-        export_historical_to_db(resampled_dict_df, granularity=key)
+        export_historical_to_db(resampled_dict_df, granularity=key, db_type=db_type)
 
-        utils.progress_bar_with_eta(i, data=times_to_resample.keys(), start_time=start_time, socketio=socketio, symbol=key, socket_invoker="resampling_progress")
-
-
+        # Assuming utils module exists
+        utils.progress_bar_with_eta(i, data=times_to_resample.keys(), start_time=start_time, 
+                                  socketio=socketio, symbol=key, socket_invoker="resampling_progress")
 
 
 
