@@ -6,7 +6,7 @@ import pandas as pd
 import core.utils.utils as utils
 import sqlite3 as sql
 import os
-import core.database_interaction as database_interaction
+import core.flexible_db as database_interaction
 import time
 from coinbase.rest import RESTClient
 import requests
@@ -225,7 +225,9 @@ class Coinbase_Wrapper():
         return missing_ranges
 
     def get_candles_for_db(self, symbols: list, granularity: str, days: int = 1, callback=None, socketio=None):
-        """Fetch candles and send real-time progress to frontend."""
+        """
+        Optimized version with better memory management and batch processing.
+        """
         if not symbols:
             print("No symbols provided.")
             return
@@ -239,130 +241,120 @@ class Coinbase_Wrapper():
         timestamps = self._get_unix_times(granularity, days=days)
         print(f"Generated {len(timestamps)} time ranges to fetch")
         
-        # Print example time range for debugging
-        if timestamps:
-            start_time = dt.datetime.fromtimestamp(timestamps[0][0])
-            end_time = dt.datetime.fromtimestamp(timestamps[0][1])
-            print(f"Example time range: {start_time} to {end_time}")
-
-        for symbol in symbols:
-            if callback:
-                callback(f"..getting data for {symbol}")
-            if socketio:
-                socketio.emit("log_update", {"message": f"Fetching data for {symbol}"})
-            print(f"\nFetching data for {symbol}")
+        # Process symbols in batches to reduce memory usage
+        BATCH_SIZE = 3  # Process 3 symbols at a time
+        
+        for batch_start in range(0, len(symbols), BATCH_SIZE):
+            batch_symbols = symbols[batch_start:batch_start + BATCH_SIZE]
+            combined_data_batch = {}
             
-            # Initialize combined dataframe
-            combined_df = pd.DataFrame()
-            
-            # Get existing data from database
-            existing_data = self._get_data_from_db(symbol, granularity)
-
-            if not existing_data.empty:
-                print(f"Found existing data for {symbol} with {len(existing_data)} rows")
-                existing_start_unix = int(existing_data.index.min().timestamp())
-                existing_end_unix = int(existing_data.index.max().timestamp())
-                print(f"Existing data range: {dt.datetime.fromtimestamp(existing_start_unix)} to {dt.datetime.fromtimestamp(existing_end_unix)}")
-            else:
-                print(f"No existing data found for {symbol}")
-                existing_start_unix = None
-                existing_end_unix = None
-
-            # Determine which time ranges we need to fetch
-            missing_date_ranges = []
-            for desired_start_unix, desired_end_unix in timestamps:
-                # Find what data is missing
-                if existing_start_unix is not None and existing_end_unix is not None:
-                    missing_ranges = self._get_missing_unix_range(
-                        desired_start_unix, desired_end_unix, existing_start_unix, existing_end_unix
-                    )
-                else:
-                    missing_ranges = [(desired_start_unix, desired_end_unix)]
-
-                missing_date_ranges.extend(missing_ranges)
-
-            if not missing_date_ranges:
-                print(f"All data for {symbol} is already up to date.")
+            for symbol in batch_symbols:
+                if callback:
+                    callback(f"..getting data for {symbol}")
                 if socketio:
-                    socketio.emit("log_update", {"message": f"All data for {symbol} is already up to date."})
-                continue
-
-            print(f"Need to fetch {len(missing_date_ranges)} time ranges for {symbol}")
-            
-            # Fetch the missing data
-            data_found = False
-            start_time = time.time()
-
-            for i, missing_range in enumerate(missing_date_ranges):
-                start_unix, end_unix = missing_range
+                    socketio.emit("log_update", {"message": f"Fetching data for {symbol}"})
+                print(f"\nFetching data for {symbol}")
                 
-                # Print human-readable dates for debugging
-                start_date = dt.datetime.fromtimestamp(start_unix)
-                end_date = dt.datetime.fromtimestamp(end_unix)
-                # print(f"Fetching range {i+1}/{len(missing_date_ranges)}: {start_date} to {end_date}")
+                # Get existing data from database
+                existing_data = self._get_data_from_db(symbol, granularity)
                 
-                # Fetch the data
-                df = self._fetch_data(symbol, start_unix, end_unix, granularity)
-
-                if not df.empty:
-                    # rows_fetched = len(df)
-                    # print(f"Fetched {rows_fetched} rows for {symbol}")
-                    
-                    combined_df = pd.concat([combined_df, df], ignore_index=True)
-                    data_found = True
-                else:
-                    print(f"No data found for {symbol} in time range")
-
-                # Update progress
-                utils.progress_bar_with_eta(i, missing_date_ranges, start_time, self.socketio, symbol, start_date, end_date)
-                percent = int(((i + 1) / len(missing_date_ranges)) * 100)
-                eta = (time.time() - start_time) / (i + 1) * (len(missing_date_ranges) - (i + 1))
-                eta_minutes, eta_seconds = divmod(int(eta), 60)
-                if socketio:
-                    socketio.emit("progress_update", {
-                        "symbol": symbol,
-                        "progress": percent,
-                        "eta": f"{eta_minutes:02d}:{eta_seconds:02d}"
-                    })
-
-            # Process and save the fetched data
-            if data_found and not combined_df.empty:
-                # print(f"Processing {len(combined_df)} rows of data for {symbol}")
-                
-                # Sort, convert numeric columns, and remove duplicates
-                sorted_df = combined_df.sort_values(by="date", ascending=True).reset_index(drop=True)
-                columns_to_convert = ['low', 'high', 'open', 'close', 'volume']
-                for col in columns_to_convert:
-                    sorted_df[col] = pd.to_numeric(sorted_df[col], errors='coerce')
-                
-                # Handle potential NaN values
-                if sorted_df.isna().any().any():
-                    # print(f"Warning: NaN values found in {symbol} data. Filling with interpolation.")
-                    sorted_df = sorted_df.interpolate(method='linear')
-                
-                sorted_df.set_index("date", inplace=True)
-                sorted_df = sorted_df[~sorted_df.index.duplicated(keep="first")]
-                
-                # Add data from existing database if available
                 if not existing_data.empty:
-                    # print(f"Merging with {len(existing_data)} existing rows of data")
-                    sorted_df = pd.concat([existing_data, sorted_df])
-                    sorted_df = sorted_df[~sorted_df.index.duplicated(keep="last")]  # Keep latest data
-                    sorted_df = sorted_df.sort_index()
+                    print(f"Found existing data for {symbol} with {len(existing_data)} rows")
+                    existing_start_unix = int(existing_data.index.min().timestamp())
+                    existing_end_unix = int(existing_data.index.max().timestamp())
+                else:
+                    print(f"No existing data found for {symbol}")
+                    existing_start_unix = None
+                    existing_end_unix = None
+
+                # Determine which time ranges we need to fetch
+                missing_date_ranges = []
+                for desired_start_unix, desired_end_unix in timestamps:
+                    if existing_start_unix is not None and existing_end_unix is not None:
+                        missing_ranges = self._get_missing_unix_range(
+                            desired_start_unix, desired_end_unix, existing_start_unix, existing_end_unix
+                        )
+                    else:
+                        missing_ranges = [(desired_start_unix, desired_end_unix)]
+                    missing_date_ranges.extend(missing_ranges)
+
+                if not missing_date_ranges:
+                    print(f"All data for {symbol} is already up to date.")
+                    if socketio:
+                        socketio.emit("log_update", {"message": f"All data for {symbol} is already up to date."})
+                    continue
+
+                print(f"Need to fetch {len(missing_date_ranges)} time ranges for {symbol}")
                 
-                combined_data = {symbol: sorted_df}
-                
-                # print(f"Saving {len(sorted_df)} rows of data for {symbol}")
+                # Fetch the missing data with rate limiting
+                new_data_frames = []
+                start_time = time.time()
+
+                for i, (start_unix, end_unix) in enumerate(missing_date_ranges):
+                    start_date = dt.datetime.fromtimestamp(start_unix)
+                    end_date = dt.datetime.fromtimestamp(end_unix)
+                    
+                    # Fetch the data
+                    df = self._fetch_data(symbol, start_unix, end_unix, granularity)
+                    
+                    if not df.empty:
+                        new_data_frames.append(df)
+                    
+                    # Update progress
+                    percent = int(((i + 1) / len(missing_date_ranges)) * 100)
+                    eta = (time.time() - start_time) / (i + 1) * (len(missing_date_ranges) - (i + 1))
+                    eta_minutes, eta_seconds = divmod(int(eta), 60)
+                    
+                    if socketio:
+                        socketio.emit("progress_update", {
+                            "symbol": symbol,
+                            "progress": percent,
+                            "eta": f"{eta_minutes:02d}:{eta_seconds:02d}"
+                        })
+                    
+                    # Add small delay to avoid rate limiting
+                    time.sleep(0.1)
+
+                # Process the fetched data
+                if new_data_frames:
+                    # Concatenate all new data at once
+                    combined_new_df = pd.concat(new_data_frames, ignore_index=True)
+                    
+                    # Sort and clean data
+                    combined_new_df = combined_new_df.sort_values(by="date", ascending=True).reset_index(drop=True)
+                    columns_to_convert = ['low', 'high', 'open', 'close', 'volume']
+                    for col in columns_to_convert:
+                        combined_new_df[col] = pd.to_numeric(combined_new_df[col], errors='coerce')
+                    
+                    # Handle NaN values
+                    if combined_new_df.isna().any().any():
+                        combined_new_df = combined_new_df.interpolate(method='linear')
+                    
+                    combined_new_df.set_index("date", inplace=True)
+                    combined_new_df = combined_new_df[~combined_new_df.index.duplicated(keep="first")]
+                    
+                    # Merge with existing data if available
+                    if not existing_data.empty:
+                        final_df = pd.concat([existing_data, combined_new_df])
+                        final_df = final_df[~final_df.index.duplicated(keep="last")]
+                        final_df = final_df.sort_index()
+                    else:
+                        final_df = combined_new_df
+                    
+                    combined_data_batch[symbol] = final_df
+                    print(f"Prepared {len(final_df)} rows of data for {symbol}")
+
+            # Save batch to database
+            if combined_data_batch:
+                print(f"Saving batch of {len(combined_data_batch)} symbols to database...")
                 if socketio:
-                    socketio.emit("log_update", {"message": f"Saving data for {symbol}"})
+                    socketio.emit("log_update", {"message": f"Saving batch to database..."})
                 
-                # Save to database
-                database_interaction.export_historical_to_db(combined_data, granularity=granularity)
-                print(f"Data saved successfully for {symbol}")
-            else:
-                # print(f"No new data found for {symbol}")
-                if socketio:
-                    socketio.emit("log_update", {"message": f"No new data available for {symbol}."})
+                database_interaction.export_historical_to_db(combined_data_batch, granularity=granularity)
+                print("Batch saved successfully")
+                
+                # Clear memory
+                del combined_data_batch
 
         # Resample data in the database to create higher timeframes
         print("\nResampling data to higher timeframes...")

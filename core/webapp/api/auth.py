@@ -6,7 +6,7 @@ import hashlib
 import base64
 from flask_cors import cross_origin
 import dotenv
-from core import database_interaction
+from database import database_interaction
 
 dotenv.load_dotenv(override=True)
 

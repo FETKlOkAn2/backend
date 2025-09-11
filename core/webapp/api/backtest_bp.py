@@ -12,7 +12,7 @@ from flask import Blueprint, request, jsonify
 sys.path.append('/opt/python')
 
 # Import your existing modules
-from core import database_interaction
+from database import database_interaction
 from core.webapp.services.backtest_service import get_strategy_class, run_backtest
 from core.webapp.api._keys_and_token import require_auth
 
@@ -214,7 +214,7 @@ def health_check():
         # Check if database module is importable
         db_status = "OK"
         try:
-            from core import database_interaction
+            from database import database_interaction
             if hasattr(database_interaction, 'save_backtest'):
                 db_status = "save_backtest function available"
             else:

@@ -1,4 +1,4 @@
-import core.database_interaction as database_interaction
+import database.database_interaction as database_interaction
 
 class Node:
     """A class representing a single node in the linked list."""

@@ -9,7 +9,7 @@ from sklearn.metrics import classification_report, accuracy_score, confusion_mat
 import talib as ta
 import gc
 import matplotlib.pyplot as plt
-from core.database_interaction import get_historical_from_db, save_backtest_results, get_db_connection, initialize_backtest_tables
+from database.database_interaction import get_historical_from_db, save_backtest_results, get_db_connection, initialize_backtest_tables
 from core.risk import Risk_Handler
 
 # Configure logging

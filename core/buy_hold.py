@@ -15,7 +15,7 @@ import json
 # Import your existing modules
 from core.strategies.strategy import Strategy
 from core.risk import Risk_Handler
-import core.database_interaction as database_interaction
+import database.database_interaction as database_interaction
 from core.backtest import Backtest
 
 class IntelligentBuyHold(Strategy):

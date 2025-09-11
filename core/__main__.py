@@ -1,6 +1,6 @@
 import time
 import asyncio
-import database_interaction
+import database.database_interaction as database_interaction
 from core.dataframe_manager import DF_Manager
 from core.strategies.strategy import Strategy
 from core.strategies.single.rsi import RSI

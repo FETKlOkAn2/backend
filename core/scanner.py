@@ -1,6 +1,6 @@
 import pandas as pd
 from core.coinbase_wrapper import Coinbase_Wrapper
-import core.database_interaction as database_interaction
+import database.database_interaction as database_interaction
 
 class Scanner():
     def __init__(self, client, socketio=None):

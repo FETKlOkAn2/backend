@@ -2,7 +2,7 @@ import core.pickling
 import datetime
 import math
 import time
-import core.database_interaction as database_interaction
+import database.database_interaction as database_interaction
 
 class Trade():
     """This class will have all logic for executing trades"""

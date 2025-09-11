@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 import pandas as pd
 from core.backtest import Backtest
 from core.strategies.gpu_optimized.GPU.rsi_adx_gpu import RSI_ADX_GPU
-import core.database_interaction as database_interaction
+import database.database_interaction as database_interaction
 
 # Configure logging
 logging.basicConfig(

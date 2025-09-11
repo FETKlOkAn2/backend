@@ -15,7 +15,7 @@ import joblib
 from datetime import datetime
 
 # Assuming these imports work with your existing setup
-from core.database_interaction import get_historical_from_db, save_backtest_results, get_db_connection, initialize_backtest_tables
+from database.database_interaction import get_historical_from_db, save_backtest_results, get_db_connection, initialize_backtest_tables
 from core.risk import Risk_Handler
 
 # Configure logging

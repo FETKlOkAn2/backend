@@ -5,7 +5,7 @@ from core.webapp.api._keys_and_token import require_auth
 
 sys.path.append('/opt/python')
 
-from core import database_interaction
+from database import database_interaction
 logger = logging.getLogger(__name__)
 
 # Create the risk blueprint
@@ -300,7 +300,7 @@ def health_check():
         # Check if database module is importable
         db_status = "OK"
         try:
-            from core import database_interaction
+            from database import database_interaction
             if hasattr(database_interaction, 'get_risk_settings'):
                 db_status = "get_risk_settings function available"
             else:

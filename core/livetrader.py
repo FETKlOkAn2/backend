@@ -19,7 +19,7 @@ from core.trade import Trade
 from core.scanner import Scanner
 from core.risk import Risk_Handler
 from core.kraken_wrapper import Kraken
-import core.database_interaction as database_interaction
+import database.database_interaction as database_interaction
 
 
 class LiveTrader:

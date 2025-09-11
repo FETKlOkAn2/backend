@@ -5,7 +5,7 @@ import pandas as pd
 import core.utils.utils as utils
 import datetime as dt
 import numpy as np
-import core.database_interaction as database_interaction
+import database.database_interaction as database_interaction
 import time
 import gc
 import gc
